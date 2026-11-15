@@ -1,8 +1,11 @@
-use std::{collections::HashMap, env, ffi::OsString, fmt::Debug, path::PathBuf, sync::Arc};
+use std::{
+    borrow::Cow, collections::HashMap, env, ffi::OsString, fmt::Debug, path::PathBuf, sync::Arc,
+};
 
 pub(crate) mod graphql;
 mod pull_request;
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use config::Config;
 use git2::Repository;
 use keep_a_changelog::{ChangeKind, ChangelogParseOptions};
@@ -54,6 +57,107 @@ pub struct Client {
     /// inherits the environment, as production wants; tests point it at an
     /// ephemeral keyring instead of mutating the process environment.
     pub(crate) gnupg_home: Option<PathBuf>,
+}
+
+/// The GitHub App's signing key from the `private_key` setting.
+///
+/// A missing setting and an unusable value are different problems and get
+/// different errors: "not found" sends the reader looking for a missing or
+/// misnamed variable, which is wrong when the variable is there and its value
+/// is in the wrong shape (base64, escaped newlines, no PEM header).
+fn app_encoding_key(settings: &Config) -> Result<octocrab::EncodingKey, Error> {
+    let raw = match settings.get::<String>("private_key") {
+        Ok(value) => value,
+        Err(config::ConfigError::NotFound(_)) => return Err(Error::NoGitHubAPIPrivateKey),
+        Err(_) => {
+            return Err(Error::InvalidGitHubAPIPrivateKey(
+                "the setting could not be read as text".to_string(),
+            ))
+        }
+    };
+
+    let (pem, stored_as) = normalise_private_key(&raw);
+    if let Some(shape) = stored_as {
+        log::warn!(
+            "The GitHub App private key was stored {shape}; accepted, but store the PEM text itself"
+        );
+    }
+
+    octocrab::EncodingKey::from_rsa_pem(pem.as_bytes())
+        .map_err(|_| Error::InvalidGitHubAPIPrivateKey(describe_unusable_private_key(&pem)))
+}
+
+/// Undo the two common ways a multi-line PEM gets mangled when it is stored in
+/// a single-line setting, so they work instead of failing with a vague error.
+/// Returns the PEM to parse and, when it had to be changed, how it was stored.
+///
+/// - base64 of the PEM: CI contexts often need a multi-line value encoded
+/// - newlines pasted as the two characters `\n`
+///
+/// Both are unambiguous: a value that is not already PEM text and decodes to
+/// PEM text, or one with `\n` escapes and no real line breaks.
+fn normalise_private_key(raw: &str) -> (Cow<'_, str>, Option<&'static str>) {
+    let trimmed = raw.trim();
+
+    if !trimmed.contains("-----BEGIN") {
+        let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+        if let Ok(bytes) = STANDARD.decode(compact) {
+            if let Ok(text) = String::from_utf8(bytes) {
+                if text.contains("-----BEGIN") {
+                    return (Cow::Owned(text), Some("as base64"));
+                }
+            }
+        }
+        return (Cow::Borrowed(raw), None);
+    }
+
+    if !trimmed.contains('\n') && trimmed.contains("\\n") {
+        return (
+            Cow::Owned(trimmed.replace("\\n", "\n")),
+            Some("with literal \\n instead of line breaks"),
+        );
+    }
+
+    (Cow::Borrowed(raw), None)
+}
+
+/// What is wrong with a value that is not a usable RSA private key, judged from
+/// its shape. Never includes any of the value apart from a PEM label drawn from
+/// a fixed list, because the value is a secret.
+fn describe_unusable_private_key(value: &str) -> String {
+    const WRONG_KINDS: [&str; 5] = [
+        "EC PRIVATE KEY",
+        "ENCRYPTED PRIVATE KEY",
+        "OPENSSH PRIVATE KEY",
+        "PUBLIC KEY",
+        "CERTIFICATE",
+    ];
+
+    let value = value.trim();
+    if value.is_empty() {
+        return "the value is empty".to_string();
+    }
+    let Some(start) = value.find("-----BEGIN ") else {
+        return "it has no `-----BEGIN ...-----` line; expected the PEM text of the app's private \
+                key as downloaded from GitHub, not just the key body"
+            .to_string();
+    };
+
+    let after = &value[start + "-----BEGIN ".len()..];
+    let label = after.split("-----").next().unwrap_or("");
+    match label {
+        "RSA PRIVATE KEY" | "PRIVATE KEY" => "it has a PEM header but the key could not be \
+            parsed; it may be truncated or corrupted, or have lost the line breaks inside the \
+            key body"
+            .to_string(),
+        known if WRONG_KINDS.contains(&known) => format!(
+            "it contains a `{known}`; expected an RSA private key (`BEGIN RSA PRIVATE KEY` or \
+             `BEGIN PRIVATE KEY`)"
+        ),
+        _ => "its PEM header is not an RSA private key; expected `BEGIN RSA PRIVATE KEY` or \
+              `BEGIN PRIVATE KEY`"
+            .to_string(),
+    }
 }
 
 impl Debug for Client {
@@ -223,15 +327,11 @@ impl Client {
             Ok(app_id) => {
                 log::info!("Using {} for authentication", "GitHub App".style(bld_style));
 
-                let private_key = settings
-                    .get::<String>("private_key")
-                    .map_err(|_| Error::NoGitHubAPIPrivateKey)?;
+                let encoding_key = app_encoding_key(settings)?;
 
                 let app_id: u64 = app_id
                     .parse()
                     .map_err(|_| Error::InvalidAppId(app_id.clone()))?;
-                let encoding_key = octocrab::EncodingKey::from_rsa_pem(private_key.as_bytes())
-                    .map_err(|_| Error::NoGitHubAPIPrivateKey)?;
 
                 let app_client = Octocrab::builder()
                     .app(AppId(app_id), encoding_key)
@@ -697,5 +797,198 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("Asset file not found"), "unexpected: {msg}");
+    }
+
+    // --- GitHub App private key handling (#1136) ---------------------------
+
+    use std::sync::OnceLock;
+
+    use aws_lc_rs::{
+        encoding::{AsDer, Pkcs8V1Der},
+        rsa::{KeyPair, KeySize},
+    };
+
+    /// A throwaway RSA key as PKCS#8 PEM text, generated once per test run so
+    /// no key material is committed to the repository.
+    fn test_pem() -> &'static str {
+        static PEM: OnceLock<String> = OnceLock::new();
+        PEM.get_or_init(|| {
+            let key = KeyPair::generate(KeySize::Rsa2048).unwrap();
+            let der: Pkcs8V1Der<'static> = key.as_der().unwrap();
+            let body = STANDARD.encode(der.as_ref());
+            let wrapped: Vec<&str> = body
+                .as_bytes()
+                .chunks(64)
+                .map(|c| std::str::from_utf8(c).unwrap())
+                .collect();
+            format!(
+                "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+                wrapped.join("\n")
+            )
+        })
+    }
+
+    fn settings_with_key(value: &str) -> Config {
+        Config::builder()
+            .set_override("private_key", value)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    fn key_error(value: &str) -> Error {
+        match app_encoding_key(&settings_with_key(value)) {
+            Ok(_) => panic!("{value:?} should not be a usable key"),
+            Err(e) => e,
+        }
+    }
+
+    /// A key body line from the real key, used to check an error never echoes it.
+    fn secret_fragment() -> String {
+        test_pem().lines().nth(1).unwrap().to_string()
+    }
+
+    #[test]
+    fn a_missing_private_key_is_reported_as_missing_and_names_the_variable() {
+        let settings = Config::builder().build().unwrap();
+
+        let err = app_encoding_key(&settings).map(|_| ()).unwrap_err();
+
+        assert!(matches!(err, Error::NoGitHubAPIPrivateKey));
+        let message = err.to_string();
+        assert!(message.contains("PCU_PRIVATE_KEY"), "got: {message}");
+    }
+
+    #[test]
+    fn a_plain_pem_is_accepted_without_comment() {
+        let pem = test_pem();
+
+        assert!(app_encoding_key(&settings_with_key(pem)).is_ok());
+        let (normalised, note) = normalise_private_key(pem);
+        assert!(note.is_none());
+        assert!(matches!(normalised, Cow::Borrowed(_)), "untouched: no copy");
+    }
+
+    #[test]
+    fn the_common_mangled_shapes_are_normalised_and_accepted() {
+        let pem = test_pem();
+        let cases = [
+            ("base64 of the PEM", STANDARD.encode(pem), Some("as base64")),
+            (
+                "base64 split across lines",
+                STANDARD
+                    .encode(pem)
+                    .as_bytes()
+                    .chunks(60)
+                    .map(|c| std::str::from_utf8(c).unwrap())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                Some("as base64"),
+            ),
+            (
+                "literal \\n for line breaks",
+                pem.trim_end().replace('\n', "\\n"),
+                Some("with literal \\n instead of line breaks"),
+            ),
+        ];
+        for (name, value, expected_note) in cases {
+            let (normalised, note) = normalise_private_key(&value);
+
+            assert_eq!(note, expected_note, "{name}");
+            assert_eq!(
+                normalised.trim_end(),
+                pem.trim_end(),
+                "{name} restores the PEM"
+            );
+            assert!(
+                app_encoding_key(&settings_with_key(&value)).is_ok(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn shapes_the_parser_already_accepts_are_left_alone() {
+        let pem = test_pem();
+        for value in [
+            pem.replace('\n', "\r\n"),
+            format!("\"{}\"", pem.trim_end()),
+            pem.trim_end().replace('\n', " "),
+        ] {
+            let (_, note) = normalise_private_key(&value);
+
+            assert!(note.is_none());
+            assert!(app_encoding_key(&settings_with_key(&value)).is_ok());
+        }
+    }
+
+    #[test]
+    fn an_unusable_key_is_not_reported_as_missing() {
+        for value in ["", "   ", "just some text", "AAAA"] {
+            let err = key_error(value);
+
+            assert!(
+                matches!(err, Error::InvalidGitHubAPIPrivateKey(_)),
+                "{value:?}: {err}"
+            );
+            assert!(!err.to_string().contains("No GitHub API private key found"));
+        }
+    }
+
+    #[test]
+    fn the_message_says_what_is_wrong_with_the_value() {
+        let pem = test_pem();
+        let body_only: String = pem
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let truncated = format!("{}\n-----END PRIVATE KEY-----\n", &pem[..pem.len() / 2]);
+        let cases = [
+            ("", "empty"),
+            (body_only.as_str(), "no `-----BEGIN"),
+            (
+                "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----",
+                "`EC PRIVATE KEY`",
+            ),
+            (
+                "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----",
+                "`PUBLIC KEY`",
+            ),
+            (
+                "-----BEGIN SOMETHING ELSE-----\nAAAA\n-----END SOMETHING ELSE-----",
+                "not an RSA private key",
+            ),
+            (truncated.as_str(), "truncated or corrupted"),
+        ];
+        for (value, expected) in cases {
+            let message = key_error(value).to_string();
+
+            assert!(
+                message.contains(expected),
+                "{expected:?} missing from: {message}"
+            );
+        }
+    }
+
+    /// The value is a secret: no error may contain any of it.
+    #[test]
+    fn errors_never_contain_the_key() {
+        let fragment = secret_fragment();
+        let pem = test_pem();
+        let values = [
+            pem[..pem.len() / 2].to_string(),
+            pem.lines().skip(1).collect::<Vec<_>>().join("\n"),
+            pem.replace("PRIVATE KEY", "WEIRD KEY"),
+        ];
+        for value in values {
+            let message = key_error(&value).to_string();
+
+            assert!(
+                !message.contains(&fragment),
+                "the message leaks part of the key: {message}"
+            );
+            assert!(message.len() < 400, "short and fixed: {message}");
+        }
     }
 }

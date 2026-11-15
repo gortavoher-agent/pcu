@@ -153,6 +153,20 @@ $
 
 ```
 
+### GitHub authentication
+
+Commands that call the GitHub API authenticate as a GitHub App when `PCU_APP_ID` is set, and otherwise fall back to a personal access token (`PCU_PAT`). Like every pcu setting, each can come from an environment variable or from `pcu.toml`.
+
+| Setting | Environment variable | Value |
+|---|---|---|
+| `app_id` | `PCU_APP_ID` | the app's numeric id |
+| `private_key` | `PCU_PRIVATE_KEY` | the app's private key as PEM text |
+| `pat` | `PCU_PAT` | a personal access token (fallback) |
+
+`PCU_PRIVATE_KEY` should be the PEM exactly as GitHub gives it: a `-----BEGIN RSA PRIVATE KEY-----` (or `-----BEGIN PRIVATE KEY-----`) line, the key body, and the matching `END` line. pcu also accepts the two shapes that multi-line values commonly end up in when they are stored in a single-line setting, with a warning: the PEM base64-encoded, or with its line breaks written as the two characters `\n`. Anything else is reported as an unusable key, saying what the value appears to be, and never echoing it. A key that is missing altogether is reported separately.
+
+Store these in your CI's secret store; never commit them.
+
 ## License
 
  Licensed under either of

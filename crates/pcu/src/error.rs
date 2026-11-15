@@ -42,8 +42,16 @@ pub enum Error {
     InvalidPath(OsString),
     #[error("Keep a prlog says: {0}")]
     KeepAChangelog(String),
-    #[error("No GitHub API private key found")]
+    /// The GitHub App private key setting is absent. See
+    /// [`Error::InvalidGitHubAPIPrivateKey`] for a key that is present but
+    /// unusable.
+    #[error("No GitHub API private key found: set PCU_PRIVATE_KEY (or `private_key` in pcu.toml)")]
     NoGitHubAPIPrivateKey,
+    /// The GitHub App private key setting is present but is not a PEM RSA key
+    /// that can be used to sign. The message says what the value appears to
+    /// be; it never contains the value.
+    #[error("The GitHub App private key is set but cannot be used: {0}")]
+    InvalidGitHubAPIPrivateKey(String),
     #[error("No GitHub API Authorisation found")]
     NoGitHubAPIAuth,
     #[error("Invalid GitHub App id {0:?}: expected a numeric id")]

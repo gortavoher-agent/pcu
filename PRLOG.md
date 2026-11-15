@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - deps: update rust crate openidconnect to 4.1.0(pr [#1128])
 - deps: update rust crate toml to 1.2.1(pr [#1130])
 - verify-signatures must not fail open or misreport untrusted authors; add agent signing script(pr [#1133])
+- say why a GitHub App private key is unusable, not that it is missing(pr [#1137])
 
 ## [0.6.40] - 2026-10-22
 
@@ -2755,6 +2756,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#1130]: https://github.com/jerus-org/pcu/pull/1130
 [#1122]: https://github.com/jerus-org/pcu/pull/1122
 [#1133]: https://github.com/jerus-org/pcu/pull/1133
+[#1137]: https://github.com/jerus-org/pcu/pull/1137
 [Unreleased]: https://github.com/jerus-org/pcu/compare/v0.6.40...HEAD
 [0.6.40]: https://github.com/jerus-org/pcu/compare/v0.6.39...v0.6.40
 [0.6.39]: https://github.com/jerus-org/pcu/compare/v0.6.38...v0.6.39
