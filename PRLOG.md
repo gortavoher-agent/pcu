@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - checkout needs no GitHub credentials and exports CIRCLE_SHA1(pr [#1122])
+- verify-signatures allow list and hard stop for external contributors(pr [#1138])
 
 ### Changed
 
@@ -2762,6 +2763,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#1133]: https://github.com/jerus-org/pcu/pull/1133
 [#1137]: https://github.com/jerus-org/pcu/pull/1137
 [#1135]: https://github.com/jerus-org/pcu/pull/1135
+[#1138]: https://github.com/jerus-org/pcu/pull/1138
 [Unreleased]: https://github.com/jerus-org/pcu/compare/v0.6.40...HEAD
 [0.6.40]: https://github.com/jerus-org/pcu/compare/v0.6.39...v0.6.40
 [0.6.39]: https://github.com/jerus-org/pcu/compare/v0.6.38...v0.6.39
