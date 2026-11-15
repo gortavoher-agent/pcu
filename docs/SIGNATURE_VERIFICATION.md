@@ -44,10 +44,17 @@ Is author email in trusted list?
         │            ├─── Signature valid? ──> ✅ PASS
         │            └─── No signature?   ──> ❌ FAIL (Impersonation!)
         │
-        └─── NO ───> External contributor
+        └─── NO ───> Is it on the allow list (see below)?
                      │
-                     ├─── Signed?   ──> ✅ PASS (bonus!)
-                     └─── Unsigned? ──> ✅ PASS (allowed)
+                     ├─── YES ──> MUST be signed by one of the entry's keys
+                     │            │
+                     │            ├─── Good signature, listed key? ──> ✅ PASS
+                     │            └─── Anything else?              ──> ❌ FAIL
+                     │
+                     └─── NO ───> External contributor
+                                  │
+                                  ├─── Hard stop off (default) ──> ✅ PASS, reported as Unsigned
+                                  └─── Hard stop on            ──> ❌ FAIL
 ```
 
 ## Trusted Identities
@@ -63,6 +70,50 @@ The following identities are considered trusted and **must** sign all their comm
 ### GitHub Web-Flow Key
 
 GitHub signs merge commits with its web-flow key `B5690EEEBB952194`. This key is trusted for merge commits performed via GitHub's web interface.
+
+## Allow List and Hard Stop
+
+By default an author who is not a trusted identity passes, whatever the commit's signature. That keeps the barrier low for outside contributors, but it means the check cannot act as a gate: a commit from an unexpected or compromised identity can pass, and with auto-merge be merged. Two settings change that. Both live in `pcu.toml` under `[verify_signatures]`.
+
+```toml
+[verify_signatures]
+# Fail for any commit from an author who is neither a trusted identity
+# nor on the allow list. Off unless you set it.
+fail_on_external = true
+
+# Identities accepted without being collaborators.
+[[verify_signatures.allow]]
+email = "29139614+renovate[bot]@users.noreply.github.com"
+keys = ["B5690EEEBB952194"]   # GitHub's web-flow key
+description = "Renovate (committed and signed by GitHub)"
+```
+
+The hard stop can also be turned on with `pcu verify-signatures --fail-on-external`; either one switches it on.
+
+### Allow-list entries
+
+- **`email`** is the commit's author email, matched ignoring case.
+- **`keys` is required.** An author email is self-declared: anyone can write `renovate[bot]@…` into a commit. An entry with no keys would allow-list whoever forges it, so pcu refuses to load one. A commit matches only when its signature is good and made with one of the listed keys (16 to 40 hex digits: a long key ID or a fingerprint).
+- **`description`** is a note for whoever reads the file.
+- An allow-listed identity with a missing, bad or unlisted-key signature **fails**, like a trusted identity's unsigned commit.
+- A trusted identity is always judged as trusted. An allow-list entry can never weaken that rule.
+
+Renovate authors its commits and GitHub commits and signs them, so its entry names the author email and GitHub's web-flow key.
+
+### The policy is read from the base ref
+
+pcu reads `pcu.toml` from the git object at `--base` (for example `origin/main`), **not** from the branch under review. A pull request can edit any file it contains; if the policy were read from the working tree, a PR could allow-list its own author, or switch the hard stop off, and pass its own check. A change to the policy therefore takes effect only after it has been merged, and it should go through code-owner review like any other security-sensitive file.
+
+- A missing file means the default policy.
+- A file that exists but is invalid is an **error**, never the default. Unknown keys are errors too, so a misspelt `fail_on_external` cannot silently leave the hard stop off.
+
+### Making it a gate
+
+1. Add the allow-list entries you need (for example Renovate) to `pcu.toml` and merge them.
+2. Turn the hard stop on (`fail_on_external = true`, in a second change, so the first lands without it).
+3. Make the verify job a **required status check** on the default branch, so a PR cannot merge without it. Without that, a PR can simply delete the job from its own CI configuration.
+
+The verify job must run a pcu release that includes this feature. Until then the settings are ignored.
 
 ## Configuration
 

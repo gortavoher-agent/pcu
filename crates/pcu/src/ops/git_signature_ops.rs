@@ -78,7 +78,7 @@ pub fn extract_commits(
 }
 
 /// Resolve a reference string to an OID
-fn resolve_reference(repo: &Repository, refname: &str) -> Result<Oid, Error> {
+pub(super) fn resolve_reference(repo: &Repository, refname: &str) -> Result<Oid, Error> {
     // Try as a reference first
     if let Ok(reference) = repo.find_reference(refname) {
         return reference

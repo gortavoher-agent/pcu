@@ -109,6 +109,9 @@ pub enum Error {
     /// Signature verification failed
     #[error("Signature verification failed: {0} failure(s) detected")]
     SignatureVerificationFailed(usize),
+    /// The `[verify_signatures]` policy in `pcu.toml` is invalid
+    #[error("Invalid verify-signatures policy: {0}")]
+    VerifyConfig(String),
     /// SLSA attestation error
     #[error("Attestation error: {0}")]
     Attestation(String),
