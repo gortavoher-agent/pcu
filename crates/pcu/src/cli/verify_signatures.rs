@@ -7,8 +7,10 @@ use owo_colors::OwoColorize;
 use super::CIExit;
 use crate::{
     ops::{
-        git_signature_ops::extract_commits, signature_ops::verify_commits_with,
-        trust_fetcher::fetch_trust_list, verify_config::VerifyConfig,
+        git_signature_ops::extract_commits,
+        signature_ops::verify_commits_with,
+        trust_fetcher::{fetch_trust_list, import_allow_list_keys},
+        verify_config::VerifyConfig,
     },
     Error,
 };
@@ -182,6 +184,9 @@ impl VerifySignatures {
             if policy.allow.len() == 1 { "y" } else { "ies" },
             if policy.fail_on_external { "on" } else { "off" }
         );
+
+        // Allow-listed keys must be in the keyring for git to verify them.
+        import_allow_list_keys(&readonly_client, &policy).await?;
 
         // Entries that name GitHub's web-flow key also need the login that
         // opened the PR, which GitHub authenticates. Only look it up when an

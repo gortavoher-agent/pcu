@@ -83,6 +83,10 @@ pub struct AllowEntry {
     /// GitHub logins, lowercase, one of which must have opened the pull
     /// request. Required when `keys` names the web-flow key.
     pub pr_authors: Vec<String>,
+    /// GitHub login whose registered GPG keys are fetched so `keys` can be
+    /// verified. Lowercase. Only supplies key material: trust is still decided
+    /// by `keys`, so a login that holds other keys adds nothing.
+    pub github_user: Option<String>,
     /// Why the identity is allowed: a note for whoever reads the policy.
     pub description: Option<String>,
 }
@@ -223,6 +227,16 @@ impl AllowEntry {
             )));
         }
 
+        let github_user = match raw.github_user.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(login) if login.contains(char::is_whitespace) || login.contains('/') => {
+                return Err(Error::VerifyConfig(format!(
+                    "allow entry {position}: `github_user` must be a GitHub login"
+                )));
+            }
+            Some(login) => Some(login.to_lowercase()),
+        };
+
         let description = raw
             .description
             .map(|d| d.trim().to_string())
@@ -232,6 +246,7 @@ impl AllowEntry {
             email,
             keys,
             pr_authors,
+            github_user,
             description,
         })
     }
@@ -285,6 +300,7 @@ struct RawAllow {
     keys: Vec<String>,
     #[serde(default)]
     pr_authors: Vec<String>,
+    github_user: Option<String>,
     description: Option<String>,
 }
 
@@ -391,6 +407,22 @@ mod tests {
             config.allow[0].description.as_deref(),
             Some("Renovate (committed and signed by GitHub)")
         );
+    }
+
+    #[test]
+    fn github_user_is_normalised_and_bad_values_refused() {
+        let ok = VerifyConfig::from_toml(
+            "[[verify_signatures.allow]]\nemail = \"a@b.test\"\nkeys = [\"1A2B3C4D5E6F7A8B\"]\ngithub_user = \" Some-User \"\n",
+        )
+        .unwrap();
+        assert_eq!(ok.allow[0].github_user.as_deref(), Some("some-user"));
+
+        for bad in ["a b", "owner/repo"] {
+            let text = format!(
+                "[[verify_signatures.allow]]\nemail = \"a@b.test\"\nkeys = [\"1A2B3C4D5E6F7A8B\"]\ngithub_user = \"{bad}\"\n"
+            );
+            assert!(VerifyConfig::from_toml(&text).is_err(), "{bad}");
+        }
     }
 
     #[test]
