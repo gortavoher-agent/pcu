@@ -3363,6 +3363,7 @@ dependencies = [
 name = "pcu"
 version = "0.6.40"
 dependencies = [
+ "aws-lc-rs",
  "base62",
  "base64 0.23.1",
  "cargo_toml",
