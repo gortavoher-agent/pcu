@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - checkout needs no GitHub credentials and exports CIRCLE_SHA1(pr [#1122])
 
+### Changed
+
+- ci-keep the bot's credentials away from code the branch controls(pr [#1135])
+
 ### Fixed
 
 - deps: lock file maintenance(pr [#1118])
@@ -2757,6 +2761,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#1122]: https://github.com/jerus-org/pcu/pull/1122
 [#1133]: https://github.com/jerus-org/pcu/pull/1133
 [#1137]: https://github.com/jerus-org/pcu/pull/1137
+[#1135]: https://github.com/jerus-org/pcu/pull/1135
 [Unreleased]: https://github.com/jerus-org/pcu/compare/v0.6.40...HEAD
 [0.6.40]: https://github.com/jerus-org/pcu/compare/v0.6.39...v0.6.40
 [0.6.39]: https://github.com/jerus-org/pcu/compare/v0.6.38...v0.6.39
