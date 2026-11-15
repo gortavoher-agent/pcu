@@ -72,6 +72,17 @@ jobs:
             cargo tree --target all --no-default-features --features linkedin --package pcu > /tmp/pcu-tree-linkedin.txt
             scripts/assert-crate-absent.sh /tmp/pcu-tree-linkedin.txt "--target all --no-default-features --features linkedin" lru bsky-sdk
 
+  # Builds pcu from the branch under test and hands the binary to the test-*
+  # jobs through the workspace.
+  #
+  # SECURITY: this job compiles code the branch controls, including every
+  # dependency's build script (`cargo install` runs them), so it must hold NO
+  # secrets: no `context:` in the workflow below, and none of the toolkit's
+  # gpg_key / git_config commands, which import the bot's signing key. The
+  # bot is a bypass actor on the main-branch ruleset (it can push without
+  # review or checks), so a build script that can read its credentials can
+  # write to main. Nothing here signs, commits or pushes; the build and the
+  # persisted `bin` and `bash.env` need no identity.
   test-setup:
     executor:
       name: toolkit/rust_env_rolling
@@ -90,8 +101,6 @@ jobs:
         description: "The commit message to use for the pcu test push"
     steps:
       - checkout
-      - toolkit/gpg_key
-      - toolkit/git_config
       - run:
           name: Write compiler version for cache key
           command: rustc --version > rust-toolchain-version.txt
@@ -529,11 +538,9 @@ workflows:
           min_rust_version: << pipeline.parameters.min_rust_version >>
           test_runner: nextest
           nextest_profile: ci
+      # No `context:` on purpose: see the SECURITY note on the job. This job
+      # builds branch-controlled code and must not see the bot credentials.
       - test-setup:
-          context:
-            - release
-            - bot-check
-            - pcu-app
           requires:
             - toolkit/idiomatic_rust
           filters:
