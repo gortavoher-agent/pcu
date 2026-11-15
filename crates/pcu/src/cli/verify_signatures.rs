@@ -19,6 +19,14 @@ pub struct VerifySignatures {
     #[clap(long, default_value = "origin/main")]
     pub base: String,
 
+    /// Ref the verification policy (`pcu.toml`) is read from: the allow list
+    /// and the hard stop. Deliberately separate from `--base`, which only
+    /// chooses where the commit range starts: `--base HEAD~3` must not make the
+    /// policy come from a commit that predates it. Must be a ref the branch
+    /// under review cannot change, normally the default branch.
+    #[clap(long, default_value = "origin/main")]
+    pub policy_ref: String,
+
     /// Head ref for commit range
     #[clap(long, default_value = "HEAD")]
     pub head: String,
@@ -35,7 +43,10 @@ pub struct VerifySignatures {
     #[clap(long, default_value = "200")]
     pub fetch_depth: usize,
 
-    /// Fail if trusted identities have unsigned commits
+    /// Deprecated and always on: this switch cannot be turned off from the
+    /// command line, and a failure always fails the run. Kept so existing
+    /// command lines keep working. It used to decide only whether the PR
+    /// comment was posted before failing.
     #[clap(long, default_value_t = true)]
     pub fail_on_unsigned: bool,
 
@@ -64,6 +75,7 @@ impl std::fmt::Debug for VerifySignatures {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VerifySignatures")
             .field("base", &self.base)
+            .field("policy_ref", &self.policy_ref)
             .field("head", &self.head)
             .field("repo_owner", &self.repo_owner)
             .field("repo_name", &self.repo_name)
@@ -160,19 +172,33 @@ impl VerifySignatures {
         log::info!("Fetching trust list from GitHub...");
         let trust_map = fetch_trust_list(&readonly_client, &owner, &repo).await?;
 
-        // Policy (allow list, hard stop) from the base ref, never the branch
+        // Policy (allow list, hard stop) from the policy ref, never the branch
         // under review: a PR must not be able to allow-list itself.
-        let mut policy = VerifyConfig::load_from_ref(&git_repo, &self.base)?;
-        if self.fail_on_external {
-            policy.fail_on_external = true;
-        }
+        let mut policy = resolve_policy(&git_repo, &self.policy_ref, self.fail_on_external)?;
         log::info!(
             "Policy from {}: {} allow-list entr{}, hard stop for external contributors {}",
-            self.base,
+            self.policy_ref,
             policy.allow.len(),
             if policy.allow.len() == 1 { "y" } else { "ies" },
             if policy.fail_on_external { "on" } else { "off" }
         );
+
+        // Entries that name GitHub's web-flow key also need the login that
+        // opened the PR, which GitHub authenticates. Only look it up when an
+        // entry needs it. Unknown stays None, and those entries then fail.
+        if policy.needs_pr_author() {
+            let pr = self.pr_number.or_else(pr_number_from_env);
+            policy.pr_author = match pr {
+                Some(number) => fetch_pr_author(&readonly_client, &owner, &repo, number).await,
+                None => {
+                    log::warn!(
+                        "No pull request number (--pr-number or CIRCLE_PULL_REQUEST): \
+                         allow-list entries that require a PR author will fail"
+                    );
+                    None
+                }
+            };
+        }
 
         // Step 2: Extract commits from git
         log::info!("Extracting commits from {}..{}", self.base, self.head);
@@ -193,11 +219,6 @@ impl VerifySignatures {
 
         // Step 5: Display summary
         display_summary(&summary, &results);
-
-        // Early return on failure if requested
-        if summary.failures > 0 && self.fail_on_unsigned {
-            return Err(Error::SignatureVerificationFailed(summary.failures));
-        }
 
         // Step 6: Post PR comment if requested
         if self.post_comment {
@@ -231,10 +252,64 @@ impl VerifySignatures {
             }
         }
 
-        if summary.failures > 0 {
-            Err(Error::SignatureVerificationFailed(summary.failures))
-        } else {
-            Ok(CIExit::VerificationPassed)
+        // Fail only after the comment is posted, so a failing run replaces
+        // an earlier "success" comment instead of leaving it on the PR.
+        finish(&summary)
+    }
+}
+
+/// The run's outcome: any failure fails it. Nothing, including the deprecated
+/// `--fail-on-unsigned`, can turn a failure into a pass.
+fn finish(summary: &crate::ops::signature_ops::VerificationSummary) -> Result<CIExit, Error> {
+    if summary.failures > 0 {
+        Err(Error::SignatureVerificationFailed(summary.failures))
+    } else {
+        Ok(CIExit::VerificationPassed)
+    }
+}
+
+/// Read the policy from `policy_ref` and apply the `--fail-on-external` flag,
+/// which can only switch the hard stop on, never off.
+fn resolve_policy(
+    repo: &git2::Repository,
+    policy_ref: &str,
+    fail_on_external_flag: bool,
+) -> Result<VerifyConfig, Error> {
+    let mut policy = VerifyConfig::load_from_ref(repo, policy_ref)?;
+    if fail_on_external_flag {
+        policy.fail_on_external = true;
+    }
+    Ok(policy)
+}
+
+/// The pull request number from CircleCI's `CIRCLE_PULL_REQUEST` URL.
+fn pr_number_from_env() -> Option<u64> {
+    parse_pr_number(&env::var("CIRCLE_PULL_REQUEST").ok()?)
+}
+
+/// The number at the end of a pull request URL.
+fn parse_pr_number(url: &str) -> Option<u64> {
+    url.trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The GitHub login that opened a pull request, or `None` if it cannot be
+/// determined (the failure is logged without the response body).
+async fn fetch_pr_author(
+    github: &Octocrab,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Option<String> {
+    match github.pulls(owner, repo).get(number).await {
+        Ok(pr) => pr.user.map(|user| user.login),
+        Err(e) => {
+            log::warn!("Could not look up who opened PR #{number}: {e}");
+            None
         }
     }
 }
@@ -1044,5 +1119,155 @@ mod tests {
         assert!(!off.fail_on_external);
         assert!(on.fail_on_external);
         assert!(format!("{on:?}").contains("fail_on_external: true"));
+    }
+
+    // --- policy resolution, outcome and PR number (#1132) -------------------
+
+    use crate::ops::verify_config::test_support::{commit_policy, temp_repo};
+
+    const RENOVATE_POLICY: &str = r#"
+        [verify_signatures]
+        fail_on_external = false
+
+        [[verify_signatures.allow]]
+        email = "29139614+renovate[bot]@users.noreply.github.com"
+        keys = ["B5690EEEBB952194"]
+        pr_authors = ["renovate[bot]"]
+    "#;
+
+    /// `--base` only chooses where the range starts. A commit from before the
+    /// policy existed must not become the policy source.
+    #[test]
+    fn test_policy_comes_from_the_policy_ref_not_from_an_older_base() {
+        let (_dir, repo) = temp_repo();
+        let old = commit_policy(&repo, "refs/heads/old", None, None);
+        commit_policy(&repo, "refs/heads/main", Some(RENOVATE_POLICY), Some(old));
+
+        let from_policy_ref = resolve_policy(&repo, "main", false).unwrap();
+        let from_old_commit = resolve_policy(&repo, "old", false).unwrap();
+
+        assert_eq!(from_policy_ref.allow.len(), 1);
+        assert!(
+            from_old_commit.allow.is_empty(),
+            "reading it from the old commit is what --policy-ref avoids"
+        );
+    }
+
+    #[test]
+    fn test_policy_ref_and_base_are_independent_options() {
+        use clap::Parser;
+
+        let defaults = VerifySignatures::parse_from(["verify-signatures"]);
+        let shifted_base = VerifySignatures::parse_from(["verify-signatures", "--base", "HEAD~3"]);
+        let explicit =
+            VerifySignatures::parse_from(["verify-signatures", "--policy-ref", "origin/trunk"]);
+
+        assert_eq!(defaults.policy_ref, "origin/main");
+        assert_eq!(shifted_base.base, "HEAD~3");
+        assert_eq!(
+            shifted_base.policy_ref, "origin/main",
+            "unaffected by --base"
+        );
+        assert_eq!(explicit.policy_ref, "origin/trunk");
+        assert!(format!("{explicit:?}").contains("origin/trunk"));
+    }
+
+    #[test]
+    fn test_the_flag_can_switch_the_hard_stop_on_but_never_off() {
+        let (_dir, repo) = temp_repo();
+        commit_policy(&repo, "refs/heads/main", Some(RENOVATE_POLICY), None);
+        commit_policy(
+            &repo,
+            "refs/heads/strict",
+            Some("[verify_signatures]\nfail_on_external = true\n"),
+            None,
+        );
+
+        assert!(
+            !resolve_policy(&repo, "main", false)
+                .unwrap()
+                .fail_on_external
+        );
+        assert!(
+            resolve_policy(&repo, "main", true)
+                .unwrap()
+                .fail_on_external
+        );
+        assert!(
+            resolve_policy(&repo, "strict", false)
+                .unwrap()
+                .fail_on_external
+        );
+        assert!(
+            resolve_policy(&repo, "strict", true)
+                .unwrap()
+                .fail_on_external
+        );
+    }
+
+    #[test]
+    fn test_an_unresolvable_or_invalid_policy_is_an_error_not_a_default() {
+        let (_dir, repo) = temp_repo();
+        commit_policy(
+            &repo,
+            "refs/heads/main",
+            Some("[verify_signatures]\nfail_on_extrenal = true\n"),
+            None,
+        );
+
+        assert!(resolve_policy(&repo, "main", false).is_err());
+        assert!(resolve_policy(&repo, "no-such-ref", false).is_err());
+    }
+
+    /// Any failure fails the run. The deprecated `--fail-on-unsigned` is not an
+    /// input to `finish`, so nothing can turn a hard-stop failure into a pass.
+    #[test]
+    fn test_any_failure_fails_the_run() {
+        assert!(matches!(
+            finish(&summary_with(0, 1, 1)),
+            Err(Error::SignatureVerificationFailed(1))
+        ));
+        assert!(matches!(
+            finish(&summary_with(1, 0, 0)),
+            Ok(CIExit::VerificationPassed)
+        ));
+    }
+
+    #[test]
+    fn test_pr_number_is_the_last_segment_of_the_url() {
+        assert_eq!(
+            parse_pr_number("https://github.com/jerus-org/pcu/pull/1133"),
+            Some(1133)
+        );
+        assert_eq!(
+            parse_pr_number("https://github.com/jerus-org/pcu/pull/1133/\n"),
+            Some(1133)
+        );
+        assert_eq!(parse_pr_number("42"), Some(42));
+        assert_eq!(parse_pr_number(""), None);
+        assert_eq!(
+            parse_pr_number("https://github.com/jerus-org/pcu/pulls"),
+            None
+        );
+        assert_eq!(parse_pr_number("not a url"), None);
+    }
+
+    #[test]
+    fn test_comment_explains_a_wrong_opener_failure() {
+        let results = vec![result_with(
+            "feed00001111",
+            "29139614+renovate[bot]@users.noreply.github.com",
+            VerificationReason::AllowListedWrongOpener,
+            false,
+            Some("B5690EEEBB952194"),
+        )];
+
+        let comment = build_comment(&results, &summary_with(0, 0, 1)).unwrap();
+
+        assert!(comment.contains("FAILED"), "{comment}");
+        assert!(
+            comment.contains("pull request not opened by one of its accounts"),
+            "{comment}"
+        );
     }
 }

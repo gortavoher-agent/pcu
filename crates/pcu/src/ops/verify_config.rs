@@ -10,6 +10,7 @@
 //! [[verify_signatures.allow]]
 //! email = "29139614+renovate[bot]@users.noreply.github.com"
 //! keys = ["B5690EEEBB952194"]          # GitHub's web-flow key
+//! pr_authors = ["renovate[bot]"]       # required with that key
 //! description = "Renovate (committed and signed by GitHub)"
 //! ```
 //!
@@ -27,6 +28,17 @@
 //! commit. An email-only entry would allow-list whoever forges it, so every
 //! entry must list the key(s) its commits are signed with, and a commit only
 //! matches when its signature is good and made with one of them.
+//!
+//! # GitHub's web-flow key needs a second, authenticated check
+//!
+//! GitHub signs commits it creates through its web UI and API with the
+//! web-flow key, for whatever author the caller chose. Its signature proves
+//! "GitHub made this commit", not who the author is, so email plus web-flow
+//! key can be reproduced by someone other than the bot. An entry naming that
+//! key must therefore also list `pr_authors`: the GitHub logins that must have
+//! opened the pull request. GitHub authenticates who opens a PR, so a forged
+//! author on someone else's PR no longer matches. When the opener cannot be
+//! determined the commit fails rather than passes.
 
 use std::path::Path;
 
@@ -38,6 +50,10 @@ use crate::Error;
 
 /// Path of the policy file, relative to the repository root.
 pub const POLICY_PATH: &str = "pcu.toml";
+
+/// GitHub's web-flow signing key, which signs commits GitHub creates for any
+/// author (see the module docs).
+pub(crate) const WEB_FLOW_KEY_ID: &str = "B5690EEEBB952194";
 
 /// Shortest key ID accepted. A 16-hex-digit long ID is what git reports for a
 /// signature; shorter IDs collide too easily to be a safe match.
@@ -51,6 +67,10 @@ pub struct VerifyConfig {
     pub fail_on_external: bool,
     /// Identities accepted without being collaborators.
     pub allow: Vec<AllowEntry>,
+    /// Not part of the file: the GitHub login that opened the pull request
+    /// under review, set by the caller from the GitHub API. `None` when it is
+    /// unknown (no PR, or the lookup failed).
+    pub pr_author: Option<String>,
 }
 
 /// One allow-listed identity.
@@ -60,6 +80,9 @@ pub struct AllowEntry {
     pub email: String,
     /// Key IDs (or fingerprints) its commits must be signed with, uppercase.
     pub keys: Vec<String>,
+    /// GitHub logins, lowercase, one of which must have opened the pull
+    /// request. Required when `keys` names the web-flow key.
+    pub pr_authors: Vec<String>,
     /// Why the identity is allowed: a note for whoever reads the policy.
     pub description: Option<String>,
 }
@@ -70,6 +93,12 @@ impl VerifyConfig {
     pub fn allow_entry(&self, author_email: &str) -> Option<&AllowEntry> {
         let wanted = author_email.trim().to_lowercase();
         self.allow.iter().find(|entry| entry.email == wanted)
+    }
+
+    /// Whether any allow-list entry needs the PR opener's login, so the caller
+    /// only makes the GitHub API call when it matters.
+    pub fn needs_pr_author(&self) -> bool {
+        self.allow.iter().any(|entry| !entry.pr_authors.is_empty())
     }
 
     /// Parse the policy from the text of a `pcu.toml`.
@@ -94,6 +123,7 @@ impl VerifyConfig {
         Ok(Self {
             fail_on_external: raw.fail_on_external,
             allow,
+            pr_author: None,
         })
     }
 
@@ -133,6 +163,24 @@ impl AllowEntry {
                 .any(|k| key_id.ends_with(k.as_str()) || k.ends_with(key_id.as_str()))
     }
 
+    /// Whether the pull request was opened by one of the entry's logins. An
+    /// entry with no `pr_authors` does not care. With some, an unknown opener
+    /// does not match: fail closed.
+    pub fn opener_allowed(&self, pr_author: Option<&str>) -> bool {
+        if self.pr_authors.is_empty() {
+            return true;
+        }
+        pr_author
+            .map(|login| login.trim().to_lowercase())
+            .is_some_and(|login| self.pr_authors.contains(&login))
+    }
+
+    /// Whether the entry names GitHub's web-flow key, in either form.
+    fn names_web_flow_key(keys: &[String]) -> bool {
+        keys.iter()
+            .any(|k| k.ends_with(WEB_FLOW_KEY_ID) || WEB_FLOW_KEY_ID.ends_with(k.as_str()))
+    }
+
     fn from_raw(raw: RawAllow, position: usize) -> Result<Self, Error> {
         let email = raw.email.trim().to_lowercase();
         if email.is_empty() || !email.contains('@') {
@@ -153,6 +201,28 @@ impl AllowEntry {
             .map(|key| normalise_key_id(key, position))
             .collect::<Result<Vec<_>, _>>()?;
 
+        let pr_authors: Vec<String> = raw
+            .pr_authors
+            .iter()
+            .map(|login| login.trim().to_lowercase())
+            .collect();
+        if pr_authors
+            .iter()
+            .any(|login| login.is_empty() || login.contains(char::is_whitespace))
+        {
+            return Err(Error::VerifyConfig(format!(
+                "allow entry {position}: `pr_authors` must be GitHub logins"
+            )));
+        }
+        if Self::names_web_flow_key(&keys) && pr_authors.is_empty() {
+            return Err(Error::VerifyConfig(format!(
+                "allow entry {position}: `keys` names GitHub's web-flow key, which signs commits \
+                 for any author, so the author email and signature cannot identify the bot. Add \
+                 `pr_authors` (the GitHub login that opens its pull requests, for example \
+                 `renovate[bot]`) so the check also requires who opened the PR"
+            )));
+        }
+
         let description = raw
             .description
             .map(|d| d.trim().to_string())
@@ -161,6 +231,7 @@ impl AllowEntry {
         Ok(Self {
             email,
             keys,
+            pr_authors,
             description,
         })
     }
@@ -212,18 +283,61 @@ struct RawAllow {
     email: String,
     #[serde(default)]
     keys: Vec<String>,
+    #[serde(default)]
+    pr_authors: Vec<String>,
     description: Option<String>,
+}
+
+/// Helpers for tests that need a git repository holding a policy file.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use git2::{Oid, Repository, Signature};
+    use tempfile::TempDir;
+
+    use super::POLICY_PATH;
+
+    pub(crate) fn temp_repo() -> (TempDir, Repository) {
+        let dir = TempDir::new().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        (dir, repo)
+    }
+
+    /// Commit to `refname` a tree holding `content` as the policy file, or an
+    /// empty tree when `None`.
+    pub(crate) fn commit_policy(
+        repo: &Repository,
+        refname: &str,
+        content: Option<&str>,
+        parent: Option<Oid>,
+    ) -> Oid {
+        let mut builder = repo.treebuilder(None).unwrap();
+        if let Some(content) = content {
+            let blob = repo.blob(content.as_bytes()).unwrap();
+            builder.insert(POLICY_PATH, blob, 0o100644).unwrap();
+        }
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let sig = Signature::now("t", "t@example.test").unwrap();
+        let parents: Vec<_> = parent
+            .map(|p| repo.find_commit(p).unwrap())
+            .into_iter()
+            .collect();
+        let parents: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(Some(refname), &sig, &sig, "policy", &tree, &parents)
+            .unwrap()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use git2::{Oid, Signature};
-    use tempfile::TempDir;
+    use git2::Oid;
 
+    use super::test_support::{commit_policy, temp_repo};
     use super::*;
 
     const RENOVATE: &str = "29139614+renovate[bot]@users.noreply.github.com";
-    const WEB_FLOW: &str = "B5690EEEBB952194";
+    const WEB_FLOW: &str = WEB_FLOW_KEY_ID;
+    /// A key that signs only for its owner, so it needs no `pr_authors`.
+    const OTHER_KEY: &str = "1A2B3C4D5E6F7A8B";
 
     fn renovate_policy() -> String {
         format!(
@@ -236,6 +350,7 @@ mod tests {
             [[verify_signatures.allow]]
             email = "{RENOVATE}"
             keys = ["{WEB_FLOW}"]
+            pr_authors = ["renovate[bot]"]
             description = "Renovate (committed and signed by GitHub)"
             "#
         )
@@ -350,7 +465,7 @@ mod tests {
             r#"
             [[verify_signatures.allow]]
             email = "  Renovate@Example.Test "
-            keys = ["0xb5690eeebb952194", "b569 0eee bb95 2194"]
+            keys = ["0x1a2b3c4d5e6f7a8b", "1a2b 3c4d 5e6f 7a8b"]
             "#,
         )
         .unwrap();
@@ -358,7 +473,7 @@ mod tests {
         assert_eq!(config.allow[0].email, "renovate@example.test");
         assert_eq!(
             config.allow[0].keys,
-            vec![WEB_FLOW.to_string(), WEB_FLOW.to_string()]
+            vec![OTHER_KEY.to_string(), OTHER_KEY.to_string()]
         );
     }
 
@@ -368,10 +483,10 @@ mod tests {
             r#"
             [[verify_signatures.allow]]
             email = "a@example.test"
-            keys = ["{WEB_FLOW}"]
+            keys = ["{OTHER_KEY}"]
             [[verify_signatures.allow]]
             email = "A@Example.Test"
-            keys = ["{WEB_FLOW}"]
+            keys = ["{OTHER_KEY}"]
             "#
         ));
 
@@ -406,7 +521,7 @@ mod tests {
     fn approves_a_fingerprint_entry_from_a_long_id() {
         let fingerprint = format!("{}{WEB_FLOW}", "A".repeat(24));
         let config = VerifyConfig::from_toml(&format!(
-            "[[verify_signatures.allow]]\nemail = \"a@example.test\"\nkeys = [\"{fingerprint}\"]\n"
+            "[[verify_signatures.allow]]\nemail = \"a@example.test\"\nkeys = [\"{fingerprint}\"]\npr_authors = [\"renovate[bot]\"]\n"
         ))
         .unwrap();
 
@@ -416,33 +531,11 @@ mod tests {
     // --- reading the policy from a git ref ---------------------------------
 
     fn commit_file(repo: &Repository, refname: &str, content: &str, parent: Option<Oid>) -> Oid {
-        let blob = repo.blob(content.as_bytes()).unwrap();
-        let mut builder = repo.treebuilder(None).unwrap();
-        builder.insert(POLICY_PATH, blob, 0o100644).unwrap();
-        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
-        let sig = Signature::now("t", "t@example.test").unwrap();
-        let parents: Vec<_> = parent
-            .map(|p| repo.find_commit(p).unwrap())
-            .into_iter()
-            .collect();
-        let parents: Vec<&git2::Commit> = parents.iter().collect();
-        repo.commit(Some(refname), &sig, &sig, "policy", &tree, &parents)
-            .unwrap()
+        commit_policy(repo, refname, Some(content), parent)
     }
 
     fn empty_commit(repo: &Repository, refname: &str) -> Oid {
-        let tree = repo
-            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
-            .unwrap();
-        let sig = Signature::now("t", "t@example.test").unwrap();
-        repo.commit(Some(refname), &sig, &sig, "no policy", &tree, &[])
-            .unwrap()
-    }
-
-    fn temp_repo() -> (TempDir, Repository) {
-        let dir = TempDir::new().unwrap();
-        let repo = Repository::init(dir.path()).unwrap();
-        (dir, repo)
+        commit_policy(repo, refname, None, None)
     }
 
     #[test]
@@ -468,7 +561,7 @@ mod tests {
             fail_on_external = false
             [[verify_signatures.allow]]
             email = "attacker@example.test"
-            keys = ["{WEB_FLOW}"]
+            keys = ["{OTHER_KEY}"]
             "#
         );
         commit_file(&repo, "refs/heads/feature", &hostile, Some(base));
@@ -518,5 +611,98 @@ mod tests {
         empty_commit(&repo, "refs/heads/main");
 
         assert!(VerifyConfig::load_from_ref(&repo, "no-such-ref").is_err());
+    }
+
+    // --- web-flow entries need an authenticated second check (#1132) -------
+
+    /// GitHub's web-flow key signs for any author, so the email and signature
+    /// cannot tell the bot from someone using its author email.
+    #[test]
+    fn an_entry_naming_the_web_flow_key_must_list_pr_authors() {
+        let fingerprint = format!("{}{WEB_FLOW}", "A".repeat(24));
+        for key in [WEB_FLOW.to_string(), WEB_FLOW.to_lowercase(), fingerprint] {
+            let message = err(&format!(
+                "[[verify_signatures.allow]]\nemail = \"{RENOVATE}\"\nkeys = [\"{key}\"]\n"
+            ));
+
+            assert!(message.contains("web-flow"), "{key}: {message}");
+            assert!(message.contains("`pr_authors`"), "{key}: {message}");
+        }
+    }
+
+    #[test]
+    fn web_flow_with_pr_authors_is_accepted() {
+        assert!(VerifyConfig::from_toml(&renovate_policy()).is_ok());
+    }
+
+    #[test]
+    fn a_key_that_signs_only_for_its_owner_needs_no_pr_authors() {
+        let config = VerifyConfig::from_toml(&format!(
+            "[[verify_signatures.allow]]\nemail = \"bot@example.test\"\nkeys = [\"{OTHER_KEY}\"]\n"
+        ))
+        .unwrap();
+
+        assert!(config.allow[0].pr_authors.is_empty());
+        assert!(!config.needs_pr_author());
+    }
+
+    #[test]
+    fn needs_pr_author_only_when_an_entry_lists_them() {
+        assert!(VerifyConfig::from_toml(&renovate_policy())
+            .unwrap()
+            .needs_pr_author());
+        assert!(!VerifyConfig::default().needs_pr_author());
+    }
+
+    #[test]
+    fn pr_authors_are_normalised_and_blank_ones_refused() {
+        let config = VerifyConfig::from_toml(&format!(
+            "[[verify_signatures.allow]]\nemail = \"a@example.test\"\nkeys = [\"{OTHER_KEY}\"]\n\
+             pr_authors = [\"  Renovate[bot] \"]\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            config.allow[0].pr_authors,
+            vec!["renovate[bot]".to_string()]
+        );
+
+        for bad in ["\"\"", "\"   \"", "\"two words\""] {
+            let message = err(&format!(
+                "[[verify_signatures.allow]]\nemail = \"a@example.test\"\nkeys = [\"{OTHER_KEY}\"]\n\
+                 pr_authors = [{bad}]\n"
+            ));
+            assert!(message.contains("GitHub logins"), "{bad}: {message}");
+        }
+    }
+
+    #[test]
+    fn opener_allowed_matches_the_login_ignoring_case() {
+        let config = VerifyConfig::from_toml(&renovate_policy()).unwrap();
+        let entry = &config.allow[0];
+
+        assert!(entry.opener_allowed(Some("renovate[bot]")));
+        assert!(entry.opener_allowed(Some("Renovate[Bot]")));
+        assert!(entry.opener_allowed(Some("  renovate[bot] ")));
+        assert!(!entry.opener_allowed(Some("someone-else")));
+        assert!(!entry.opener_allowed(Some("")));
+    }
+
+    /// When the opener is unknown the check cannot be confirmed, so it fails.
+    #[test]
+    fn opener_allowed_fails_closed_when_the_opener_is_unknown() {
+        let config = VerifyConfig::from_toml(&renovate_policy()).unwrap();
+
+        assert!(!config.allow[0].opener_allowed(None));
+    }
+
+    #[test]
+    fn an_entry_without_pr_authors_ignores_the_opener() {
+        let config = VerifyConfig::from_toml(&format!(
+            "[[verify_signatures.allow]]\nemail = \"bot@example.test\"\nkeys = [\"{OTHER_KEY}\"]\n"
+        ))
+        .unwrap();
+
+        assert!(config.allow[0].opener_allowed(None));
+        assert!(config.allow[0].opener_allowed(Some("anyone")));
     }
 }

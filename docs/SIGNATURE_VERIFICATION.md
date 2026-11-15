@@ -85,6 +85,7 @@ fail_on_external = true
 [[verify_signatures.allow]]
 email = "29139614+renovate[bot]@users.noreply.github.com"
 keys = ["B5690EEEBB952194"]   # GitHub's web-flow key
+pr_authors = ["renovate[bot]"]  # required with that key, see below
 description = "Renovate (committed and signed by GitHub)"
 ```
 
@@ -94,18 +95,33 @@ The hard stop can also be turned on with `pcu verify-signatures --fail-on-extern
 
 - **`email`** is the commit's author email, matched ignoring case.
 - **`keys` is required.** An author email is self-declared: anyone can write `renovate[bot]@…` into a commit. An entry with no keys would allow-list whoever forges it, so pcu refuses to load one. A commit matches only when its signature is good and made with one of the listed keys (16 to 40 hex digits: a long key ID or a fingerprint).
+- **`pr_authors`** is a list of GitHub logins, one of which must have opened the pull request. It is **required when `keys` names GitHub's web-flow key** and optional otherwise (see below).
 - **`description`** is a note for whoever reads the file.
 - An allow-listed identity with a missing, bad or unlisted-key signature **fails**, like a trusted identity's unsigned commit.
 - A trusted identity is always judged as trusted. An allow-list entry can never weaken that rule.
 
 Renovate authors its commits and GitHub commits and signs them, so its entry names the author email and GitHub's web-flow key.
 
-### The policy is read from the base ref
+### GitHub's web-flow key needs a second check
 
-pcu reads `pcu.toml` from the git object at `--base` (for example `origin/main`), **not** from the branch under review. A pull request can edit any file it contains; if the policy were read from the working tree, a PR could allow-list its own author, or switch the hard stop off, and pass its own check. A change to the policy therefore takes effect only after it has been merged, and it should go through code-owner review like any other security-sensitive file.
+GitHub signs the commits it creates through its web UI and API with the web-flow key, **for whatever author the caller chose**. That signature proves "GitHub made this commit", not who the author is. A commit that claims `renovate[bot]` as its author can arrive with a good, listed web-flow signature even though someone else made it. So an entry that names the web-flow key must also list `pr_authors`, the GitHub logins that must have opened the pull request. GitHub authenticates who opens a PR, so a forged author on someone else's PR no longer matches.
+
+- pcu looks the opener up with the GitHub API, using the PR number from `--pr-number` or, failing that, from CircleCI's `CIRCLE_PULL_REQUEST`.
+- If the opener cannot be determined (no PR number, or the lookup fails), the entry **fails closed**: the commit fails rather than passes.
+- pcu refuses to load a policy where an entry names the web-flow key without `pr_authors`.
+
+### The policy is read from a trusted ref
+
+pcu reads `pcu.toml` from the git object at `--policy-ref` (default `origin/main`), **not** from the branch under review. A pull request can edit any file it contains; if the policy were read from the working tree, a PR could allow-list its own author, or switch the hard stop off, and pass its own check. A change to the policy therefore takes effect only after it has been merged, and it should go through code-owner review like any other security-sensitive file.
+
+`--policy-ref` is separate from `--base` on purpose. `--base` only chooses where the commit range starts; `--base HEAD~3` must not make the policy come from a commit that predates it. If your default branch is not `main`, set `--policy-ref` to it. It must be a ref the branch under review cannot change.
 
 - A missing file means the default policy.
 - A file that exists but is invalid is an **error**, never the default. Unknown keys are errors too, so a misspelt `fail_on_external` cannot silently leave the hard stop off.
+
+### Failures always fail the run
+
+Any failed commit makes `pcu verify-signatures` exit non-zero, and the PR comment is posted **before** it fails, so a failing run replaces an earlier "success" comment instead of leaving it on the PR. The old `--fail-on-unsigned` switch is deprecated: it could only ever be on, and nothing turns a failure into a pass.
 
 ### Making it a gate
 

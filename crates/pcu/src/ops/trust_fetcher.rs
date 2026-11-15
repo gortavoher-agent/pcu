@@ -334,7 +334,7 @@ fn import_key_to_gpg(raw_key: &str) -> Result<(), Error> {
 /// GitHub signs merge commits with their web-flow key.
 /// Key ID: B5690EEEBB952194
 fn add_github_webflow_key(trust_map: &mut TrustMap) -> Result<(), Error> {
-    const GITHUB_WEBFLOW_KEY: &str = "B5690EEEBB952194";
+    const GITHUB_WEBFLOW_KEY: &str = super::verify_config::WEB_FLOW_KEY_ID;
     const GITHUB_WEBFLOW_EMAIL: &str = "noreply@github.com";
 
     log::debug!("Adding GitHub web-flow key for merge commits");
