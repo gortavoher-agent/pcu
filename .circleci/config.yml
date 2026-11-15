@@ -12,6 +12,31 @@ orbs:
 #   - toolkit/rust_env_rolling for Rust jobs
 #   - toolkit/base_env for base jobs
 
+# Commands used by the test-* jobs.
+commands:
+  # An ephemeral identity for the jobs that run the branch-built pcu.
+  #
+  # Those jobs commit (and sign) locally to exercise pcu, but they must not
+  # hold the bot's real signing key: the bot is a bypass actor on the
+  # main-branch ruleset, and this binary is built from code the branch controls.
+  # So each job generates a throwaway key, valid for a day, that exists only in
+  # that job's container. Nothing is stored, so there is nothing to leak.
+  test_identity:
+    steps:
+      - run:
+          name: Create an ephemeral test signing identity
+          command: |
+            set -euo pipefail
+            gpg --batch --pinentry-mode loopback --passphrase '' \
+              --quick-generate-key "pcu CI test <pcu-ci-test@example.invalid>" ed25519 sign 1d
+            fingerprint="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/{print $10; exit}')"
+            git config --global user.name "pcu CI test"
+            git config --global user.email "pcu-ci-test@example.invalid"
+            git config --global gpg.program gpg
+            git config --global user.signingkey "$fingerprint"
+            git config --global commit.gpgsign true
+            echo 'export BOT_USER_NAME="pcu CI test"' >> "$BASH_ENV"
+
 jobs:
   # ── Retired cache-experiment jobs (exp-required-builds, exp-idiomatic-rust,
   # exp-msrv-build, exp-test-doc-build, exp-optional-builds) ──────────────────
@@ -72,6 +97,17 @@ jobs:
             cargo tree --target all --no-default-features --features linkedin --package pcu > /tmp/pcu-tree-linkedin.txt
             scripts/assert-crate-absent.sh /tmp/pcu-tree-linkedin.txt "--target all --no-default-features --features linkedin" lru bsky-sdk
 
+  # Builds pcu from the branch under test and hands the binary to the test-*
+  # jobs through the workspace.
+  #
+  # SECURITY: this job compiles code the branch controls, including every
+  # dependency's build script (`cargo install` runs them), so it must hold NO
+  # secrets: no `context:` in the workflow below, and none of the toolkit's
+  # gpg_key / git_config commands, which import the bot's signing key. The
+  # bot is a bypass actor on the main-branch ruleset (it can push without
+  # review or checks), so a build script that can read its credentials can
+  # write to main. Nothing here signs, commits or pushes; the build and the
+  # persisted `bin` and `bash.env` need no identity.
   test-setup:
     executor:
       name: toolkit/rust_env_rolling
@@ -90,8 +126,6 @@ jobs:
         description: "The commit message to use for the pcu test push"
     steps:
       - checkout
-      - toolkit/gpg_key
-      - toolkit/git_config
       - run:
           name: Write compiler version for cache key
           command: rustc --version > rust-toolchain-version.txt
@@ -147,8 +181,7 @@ jobs:
         description: "The commit message to use for the pcu test push"
     steps:
       - checkout
-      - toolkit/gpg_key
-      - toolkit/git_config
+      - test_identity
       # Start with the test setup workspace
       - attach_workspace:
           at: .
@@ -217,8 +250,7 @@ jobs:
         description: "Whether or not prevent final push of commit"
     steps:
       - checkout
-      - toolkit/gpg_key
-      - toolkit/git_config
+      - test_identity
       # Start with the test setup workspace
       - attach_workspace:
           at: .
@@ -253,8 +285,7 @@ jobs:
         description: "Whether or not prevent final push of commit"
     steps:
       - checkout
-      - toolkit/gpg_key
-      - toolkit/git_config
+      - test_identity
       # Start with the test setup workspace
       - attach_workspace:
           at: .
@@ -310,8 +341,7 @@ jobs:
         description: "Whether or not prevent final push of commit"
     steps:
       - checkout
-      - toolkit/gpg_key
-      - toolkit/git_config
+      - test_identity
       # Start with the test setup workspace
       - attach_workspace:
           at: .
@@ -379,8 +409,7 @@ jobs:
         description: "The verbosity of the pcu command"
     steps:
       - checkout
-      - toolkit/gpg_key
-      - toolkit/git_config
+      - test_identity
       - attach_workspace:
           at: .
       - run:
@@ -427,8 +456,7 @@ jobs:
         description: "The verbosity of the pcu command"
     steps:
       - checkout
-      - toolkit/gpg_key
-      - toolkit/git_config
+      - test_identity
       - attach_workspace:
           at: .
       - run:
@@ -529,11 +557,9 @@ workflows:
           min_rust_version: << pipeline.parameters.min_rust_version >>
           test_runner: nextest
           nextest_profile: ci
+      # No `context:` on purpose: see the SECURITY note on the job. This job
+      # builds branch-controlled code and must not see the bot credentials.
       - test-setup:
-          context:
-            - release
-            - bot-check
-            - pcu-app
           requires:
             - toolkit/idiomatic_rust
           filters:
@@ -562,9 +588,7 @@ workflows:
       - test-commit:
           pcu_verbosity: "-vvvv"
           context:
-            - release
-            - bot-check
-            - pcu-app
+            - pcu-app-test
           filters:
             branches:
               ignore: main
@@ -580,9 +604,7 @@ workflows:
           pcu_verbosity: "-vvvv"
           pcu_no_push: true
           context:
-            - release
-            - bot-check
-            - pcu-app
+            - pcu-app-test
           filters:
             branches:
               ignore: main
@@ -598,9 +620,7 @@ workflows:
           pcu_verbosity: "-vvvv"
           pcu_no_push: true
           context:
-            - release
-            - bot-check
-            - pcu-app
+            - pcu-app-test
             - bluesky
           filters:
             branches:
@@ -617,9 +637,7 @@ workflows:
           pcu_verbosity: "-vvvv"
           pcu_no_push: true
           context:
-            - release
-            - bot-check
-            - pcu-app
+            - pcu-app-test
             - bluesky
           filters:
             branches:
@@ -635,9 +653,7 @@ workflows:
       - test-linkedin-directory:
           pcu_verbosity: "-vvvv"
           context:
-            - release
-            - bot-check
-            - pcu-app
+            - pcu-app-test
           filters:
             branches:
               ignore: main
@@ -652,9 +668,7 @@ workflows:
       - test-linkedin-file:
           pcu_verbosity: "-vvvv"
           context:
-            - release
-            - bot-check
-            - pcu-app
+            - pcu-app-test
           filters:
             branches:
               ignore: main
