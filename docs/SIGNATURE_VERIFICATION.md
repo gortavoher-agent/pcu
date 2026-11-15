@@ -44,10 +44,17 @@ Is author email in trusted list?
         │            ├─── Signature valid? ──> ✅ PASS
         │            └─── No signature?   ──> ❌ FAIL (Impersonation!)
         │
-        └─── NO ───> External contributor
+        └─── NO ───> Is it on the allow list (see below)?
                      │
-                     ├─── Signed?   ──> ✅ PASS (bonus!)
-                     └─── Unsigned? ──> ✅ PASS (allowed)
+                     ├─── YES ──> MUST be signed by one of the entry's keys
+                     │            │
+                     │            ├─── Good signature, listed key? ──> ✅ PASS
+                     │            └─── Anything else?              ──> ❌ FAIL
+                     │
+                     └─── NO ───> External contributor
+                                  │
+                                  ├─── Hard stop off (default) ──> ✅ PASS, reported as Unsigned
+                                  └─── Hard stop on            ──> ❌ FAIL
 ```
 
 ## Trusted Identities
@@ -63,6 +70,91 @@ The following identities are considered trusted and **must** sign all their comm
 ### GitHub Web-Flow Key
 
 GitHub signs merge commits with its web-flow key `B5690EEEBB952194`. This key is trusted for merge commits performed via GitHub's web interface.
+
+## Allow List and Hard Stop
+
+By default an author who is not a trusted identity passes, whatever the commit's signature. That keeps the barrier low for outside contributors, but it means the check cannot act as a gate: a commit from an unexpected or compromised identity can pass, and with auto-merge be merged. Two settings change that. Both live in `pcu.toml` under `[verify_signatures]`.
+
+```toml
+[verify_signatures]
+# Fail for any commit from an author who is neither a trusted identity
+# nor on the allow list. Off unless you set it.
+fail_on_external = true
+
+# Identities accepted without being collaborators.
+[[verify_signatures.allow]]
+email = "29139614+renovate[bot]@users.noreply.github.com"
+keys = ["B5690EEEBB952194"]   # GitHub's web-flow key
+pr_authors = ["renovate[bot]"]  # required with that key, see below
+description = "Renovate (committed and signed by GitHub)"
+```
+
+The hard stop can also be turned on with `pcu verify-signatures --fail-on-external`; either one switches it on.
+
+### Allow-list entries
+
+- **`email`** is the commit's author email, matched ignoring case.
+- **`keys` is required.** An author email is self-declared: anyone can write `renovate[bot]@…` into a commit. An entry with no keys would allow-list whoever forges it, so pcu refuses to load one. A commit matches only when its signature is good and made with one of the listed keys (16 to 40 hex digits: a long key ID or a fingerprint).
+- **`pr_authors`** is a list of GitHub logins, one of which must have opened the pull request. It is **required when `keys` names GitHub's web-flow key** and optional otherwise (see below).
+- **`description`** is a note for whoever reads the file.
+- An allow-listed identity with a missing, bad or unlisted-key signature **fails**, like a trusted identity's unsigned commit.
+- A trusted identity is always judged as trusted. An allow-list entry can never weaken that rule.
+
+Renovate authors its commits and GitHub commits and signs them, so its entry names the author email and GitHub's web-flow key.
+
+- **`github_user`** (optional) is the GitHub account that has the key registered. pcu fetches that account's GPG keys so the signature can be verified. Only keys matching the entry's `keys` are imported, and the entry's `keys` still decide what passes, so naming an account grants no trust of its own. List the **signing subkey's ID** (what `git log --format=%GK` shows), not just the primary key, because git reports the subkey.
+
+### Where allow-listed keys come from
+
+`git` can only verify a signature whose public key is in the keyring. Keys of write collaborators and GitHub's web-flow key are imported automatically. For every other key an entry lists, pcu tries, in order:
+
+1. the entry's `github_user`, via GitHub's `/users/{login}/gpg_keys`;
+2. `keys.openpgp.org`, **only for a full 40-digit fingerprint** (a short ID can be forged by collision, a fingerprint cannot).
+
+If a key still cannot be found, the run **fails with a message naming the entry** rather than reporting every commit as unverifiable. An entry that lists only the web-flow key needs neither.
+
+### GitHub's web-flow key needs a second check
+
+GitHub signs the commits it creates through its web UI and API with the web-flow key, **for whatever author the caller chose**. That signature proves "GitHub made this commit", not who the author is. A commit that claims `renovate[bot]` as its author can arrive with a good, listed web-flow signature even though someone else made it. So an entry that names the web-flow key must also list `pr_authors`, the GitHub logins that must have opened the pull request. GitHub authenticates who opens a PR, so a forged author on someone else's PR no longer matches.
+
+- pcu looks the opener up with the GitHub API, using the PR number from `--pr-number` or, failing that, from CircleCI's `CIRCLE_PULL_REQUEST`.
+- If the opener cannot be determined (no PR number, or the lookup fails), the entry **fails closed**: the commit fails rather than passes.
+- pcu refuses to load a policy where an entry names the web-flow key without `pr_authors`.
+
+### The policy is read from a trusted ref
+
+pcu reads `pcu.toml` from the git object at `--policy-ref` (default `origin/main`), **not** from the branch under review. A pull request can edit any file it contains; if the policy were read from the working tree, a PR could allow-list its own author, or switch the hard stop off, and pass its own check. A change to the policy therefore takes effect only after it has been merged, and it should go through code-owner review like any other security-sensitive file.
+
+`--policy-ref` is separate from `--base` on purpose. `--base` only chooses where the commit range starts; `--base HEAD~3` must not make the policy come from a commit that predates it. If your default branch is not `main`, set `--policy-ref` to it. It must be a ref the branch under review cannot change.
+
+- A missing file means the default policy.
+- A file that exists but is invalid is an **error**, never the default. Unknown keys are errors too, so a misspelt `fail_on_external` cannot silently leave the hard stop off.
+
+### Failures always fail the run
+
+Any failed commit makes `pcu verify-signatures` exit non-zero, and the PR comment is posted **before** it fails, so a failing run replaces an earlier "success" comment instead of leaving it on the PR. The old `--fail-on-unsigned` switch is deprecated: it could only ever be on, and nothing turns a failure into a pass.
+
+### Making it a gate
+
+1. Add the allow-list entries you need (for example Renovate) to `pcu.toml` and merge them.
+2. Turn the hard stop on (`fail_on_external = true`, in a second change, so the first lands without it).
+3. Make the verify job a **required status check** on the default branch, so a PR cannot merge without it. Without that, a PR can simply delete the job from its own CI configuration.
+
+The verify job must run a pcu release that includes this feature. Until then the settings are ignored.
+
+## Known Limitations and Planned Follow-ups
+
+These are understood and not yet fixed. None weakens the gate: each fails closed or is cosmetic.
+
+| Area | Limitation | Planned change |
+|------|-----------|----------------|
+| Tests | No end-to-end test of the `verify-signatures` command flow (policy load, API lookups, PR comment, exit code). Logic is unit-tested piece by piece. | Add a test that drives the command against a temporary repository and a mocked GitHub API. |
+| Policy changes | A PR that edits `pcu.toml` is judged by the policy on the trusted ref, so it cannot approve itself, but the report does not point out that the policy file changed. | Flag changes to `pcu.toml` in the commit range in the report and PR comment so reviewers look at them. |
+| Failure message | A policy failure (bad `pcu.toml`, unknown ref) shows the generic "possible impersonation" action text. | Give policy and configuration failures their own text. |
+| `description` | Parsed and shown nowhere. | Show it in the allow-listed table, or remove the field. |
+| Key identity | Keys are matched by ID suffix. A fingerprint is recommended but pcu does not compare the signer's fingerprint (`%GF`). | Compare the full fingerprint when an entry lists one, and pin the web-flow fingerprint. |
+| Policy file | The policy shares `pcu.toml` with other commands, and there is no lint-only mode. | Add `--check-policy` and consider a dedicated policy file. |
+| Test code | Duplicate helpers across the test modules. | Consolidate into `test_support`. |
 
 ## Configuration
 

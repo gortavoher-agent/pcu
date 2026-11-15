@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use super::verify_config::{AllowEntry, VerifyConfig};
+
 /// Trust map: email -> list of approved GPG key IDs
 pub type TrustMap = HashMap<String, Vec<String>>;
 
@@ -75,6 +77,23 @@ pub enum VerificationReason {
     /// forged signature, a compromised key). Still allowed today; the
     /// hard-stop mode (#1132) is where it can be made to fail.
     ExternalInvalidSignature,
+    /// Not a trusted identity, but on the policy's allow list, and the commit
+    /// carries a good signature made with one of the entry's keys.
+    AllowListed,
+    /// On the allow list, but the commit is unsigned, badly signed or signed
+    /// with a key the entry does not name (FAIL). Anyone can forge an author
+    /// email, so this is treated like an impersonation attempt.
+    AllowListedBadSignature,
+    /// On the allow list with a good signature from a listed key, but the pull
+    /// request was not opened by one of the entry's `pr_authors` (FAIL), or
+    /// the opener could not be determined. GitHub's web-flow key signs
+    /// commits for any author, so the author email and signature alone do not
+    /// identify the bot.
+    AllowListedWrongOpener,
+    /// Not a trusted identity and not on the allow list, with the hard stop
+    /// on (FAIL). `invalid_signature` is set when the commit also carries a
+    /// bad, expired or revoked signature.
+    ExternalNotAllowed { invalid_signature: bool },
     /// Trusted identity missing signature (FAIL)
     ImpersonationAttempt,
     /// Trusted identity signed with wrong key (FAIL)
@@ -99,6 +118,19 @@ impl VerificationReason {
             VerificationReason::ExternalInvalidSignature => {
                 "External contributor (INVALID signature, allowed)"
             }
+            VerificationReason::AllowListed => "Allow-listed identity (signed, verified)",
+            VerificationReason::AllowListedBadSignature => {
+                "Allow-listed identity: signature missing, invalid or from an unapproved key"
+            }
+            VerificationReason::AllowListedWrongOpener => {
+                "Allow-listed identity: pull request not opened by one of its accounts"
+            }
+            VerificationReason::ExternalNotAllowed {
+                invalid_signature: false,
+            } => "External contributor not on the allow list",
+            VerificationReason::ExternalNotAllowed {
+                invalid_signature: true,
+            } => "External contributor not on the allow list (INVALID signature)",
             VerificationReason::ImpersonationAttempt => {
                 "Impersonation attempt: trusted identity unsigned"
             }
@@ -113,6 +145,8 @@ impl VerificationReason {
 pub struct VerificationSummary {
     pub commits_checked: usize,
     pub trusted_verified: usize,
+    /// Commits from allow-listed identities with a verified signature.
+    pub allow_listed: usize,
     pub external_contributors: usize,
     pub failures: usize,
 }
@@ -135,14 +169,29 @@ fn trusted_keys<'a>(trust_map: &'a TrustMap, email: &str) -> Option<&'a Vec<Stri
     })
 }
 
-/// Verify a single commit against the trust map
+/// Verify a single commit against the trust map, with the default policy (no
+/// allow list, no hard stop).
+#[cfg(test)]
 pub fn verify_commit(commit: &CommitInfo, trust_map: &TrustMap) -> VerificationResult {
-    let is_trusted = trusted_keys(trust_map, &commit.author_email).is_some();
+    verify_commit_with(commit, trust_map, &VerifyConfig::default())
+}
 
-    if is_trusted {
+/// Verify a single commit against the trust map and the verification policy.
+///
+/// A trusted identity is always judged as one, whatever the policy says: an
+/// allow-list entry can never weaken the rule that a trusted identity's
+/// signature must be good and made with an approved key.
+pub fn verify_commit_with(
+    commit: &CommitInfo,
+    trust_map: &TrustMap,
+    config: &VerifyConfig,
+) -> VerificationResult {
+    if trusted_keys(trust_map, &commit.author_email).is_some() {
         verify_trusted_commit(commit, trust_map)
+    } else if let Some(entry) = config.allow_entry(&commit.author_email) {
+        verify_allow_listed_commit(commit, entry, config.pr_author.as_deref())
     } else {
-        verify_external_commit(commit)
+        verify_external_commit(commit, config)
     }
 }
 
@@ -195,19 +244,60 @@ fn is_key_approved(key_id: &str, allowed_keys: &[String]) -> bool {
         .any(|k| key_id.ends_with(k) || k.ends_with(key_id))
 }
 
-/// Verify a commit from an external contributor
-fn verify_external_commit(commit: &CommitInfo) -> VerificationResult {
+/// Verify a commit from an allow-listed identity.
+///
+/// Two checks, both required. The signature must be good and made with one of
+/// the entry's keys (the email is self-declared, so without this anyone could
+/// forge it). And when the entry lists `pr_authors`, the pull request must have
+/// been opened by one of those GitHub logins, which GitHub authenticates:
+/// GitHub's web-flow key signs commits for any author, so the signature alone
+/// does not tell the bot from someone using the same author email.
+fn verify_allow_listed_commit(
+    commit: &CommitInfo,
+    entry: &AllowEntry,
+    pr_author: Option<&str>,
+) -> VerificationResult {
+    let signed_by_an_approved_key = matches!(
+        commit.signature_status,
+        SignatureStatus::Good | SignatureStatus::Unknown
+    ) && commit
+        .key_id
+        .as_deref()
+        .is_some_and(|key_id| entry.approves(key_id));
+
+    if !signed_by_an_approved_key {
+        create_result(commit, false, VerificationReason::AllowListedBadSignature)
+    } else if !entry.opener_allowed(pr_author) {
+        create_result(commit, false, VerificationReason::AllowListedWrongOpener)
+    } else {
+        create_result(commit, true, VerificationReason::AllowListed)
+    }
+}
+
+/// Verify a commit from an external contributor: neither a trusted identity
+/// nor on the allow list. Allowed unless the policy's hard stop is on.
+fn verify_external_commit(commit: &CommitInfo, config: &VerifyConfig) -> VerificationResult {
     // The author is not in the trust map, so nothing vouches for the commit
     // whatever its signature. A signature that is actively invalid is still
     // told apart from an honest absence of one.
-    match &commit.signature_status {
+    let invalid_signature = matches!(
+        commit.signature_status,
         SignatureStatus::Bad
-        | SignatureStatus::Expired
-        | SignatureStatus::ExpiredKey
-        | SignatureStatus::Revoked => {
-            create_result(commit, true, VerificationReason::ExternalInvalidSignature)
-        }
-        _ => create_result(commit, true, VerificationReason::ExternalUnsigned),
+            | SignatureStatus::Expired
+            | SignatureStatus::ExpiredKey
+            | SignatureStatus::Revoked
+    );
+
+    if config.fail_on_external {
+        create_result(
+            commit,
+            false,
+            VerificationReason::ExternalNotAllowed { invalid_signature },
+        )
+    } else if invalid_signature {
+        create_result(commit, true, VerificationReason::ExternalInvalidSignature)
+    } else {
+        create_result(commit, true, VerificationReason::ExternalUnsigned)
     }
 }
 
@@ -224,16 +314,27 @@ fn create_result(
     }
 }
 
-/// Verify a list of commits and return summary
+/// Verify a list of commits and return summary, with the default policy.
+#[cfg(test)]
 pub fn verify_commits(
     commits: Vec<CommitInfo>,
     trust_map: &TrustMap,
+) -> (Vec<VerificationResult>, VerificationSummary) {
+    verify_commits_with(commits, trust_map, &VerifyConfig::default())
+}
+
+/// Verify a list of commits against the trust map and the policy, and return
+/// the summary.
+pub fn verify_commits_with(
+    commits: Vec<CommitInfo>,
+    trust_map: &TrustMap,
+    config: &VerifyConfig,
 ) -> (Vec<VerificationResult>, VerificationSummary) {
     let mut results = Vec::new();
     let mut summary = VerificationSummary::default();
 
     for commit in commits {
-        let result = verify_commit(&commit, trust_map);
+        let result = verify_commit_with(&commit, trust_map, config);
 
         summary.commits_checked += 1;
 
@@ -241,7 +342,12 @@ pub fn verify_commits(
             VerificationReason::TrustedVerified => {
                 summary.trusted_verified += 1;
             }
-            VerificationReason::ExternalUnsigned | VerificationReason::ExternalInvalidSignature => {
+            VerificationReason::AllowListed => {
+                summary.allow_listed += 1;
+            }
+            VerificationReason::ExternalUnsigned
+            | VerificationReason::ExternalInvalidSignature
+            | VerificationReason::ExternalNotAllowed { .. } => {
                 summary.external_contributors += 1;
             }
             _ => {}
@@ -548,5 +654,292 @@ mod tests {
             result.reason,
             VerificationReason::ExternalUnsigned
         ));
+    }
+
+    // --- allow list and hard stop (#1132) -----------------------------------
+
+    const RENOVATE: &str = "29139614+renovate[bot]@users.noreply.github.com";
+    const WEB_FLOW: &str = "B5690EEEBB952194";
+
+    fn policy(fail_on_external: bool) -> VerifyConfig {
+        let mut config = VerifyConfig::from_toml(&format!(
+            r#"
+            [verify_signatures]
+            fail_on_external = {fail_on_external}
+
+            [[verify_signatures.allow]]
+            email = "{RENOVATE}"
+            keys = ["{WEB_FLOW}"]
+            pr_authors = ["renovate[bot]"]
+            description = "Renovate (committed and signed by GitHub)"
+            "#
+        ))
+        .unwrap();
+        // The legitimate case: Renovate opened the pull request.
+        config.pr_author = Some("renovate[bot]".to_string());
+        config
+    }
+
+    /// The case from the issue: Renovate authors the commit, GitHub's web-flow
+    /// key signs it.
+    #[test]
+    fn test_renovate_signed_by_web_flow_is_allow_listed() {
+        let commit = commit_by(RENOVATE, SignatureStatus::Good, Some(WEB_FLOW));
+
+        let (results, summary) = verify_commits_with(vec![commit], &trusted_map(), &policy(true));
+
+        assert!(results[0].passed);
+        assert!(matches!(results[0].reason, VerificationReason::AllowListed));
+        assert_eq!(summary.allow_listed, 1);
+        assert_eq!(summary.external_contributors, 0);
+        assert_eq!(summary.failures, 0);
+    }
+
+    #[test]
+    fn test_allow_listed_with_unknown_validity_and_approved_key_passes() {
+        let commit = commit_by(RENOVATE, SignatureStatus::Unknown, Some(WEB_FLOW));
+
+        let result = verify_commit_with(&commit, &trusted_map(), &policy(false));
+
+        assert!(matches!(result.reason, VerificationReason::AllowListed));
+    }
+
+    #[test]
+    fn test_allow_listed_email_matches_in_any_case() {
+        let commit = commit_by(
+            &RENOVATE.to_uppercase(),
+            SignatureStatus::Good,
+            Some(WEB_FLOW),
+        );
+
+        let result = verify_commit_with(&commit, &trusted_map(), &policy(true));
+
+        assert!(matches!(result.reason, VerificationReason::AllowListed));
+    }
+
+    /// A forged email must not get through: the signature has to match.
+    #[test]
+    fn test_allow_listed_email_without_an_approved_signature_fails() {
+        let cases = [
+            ("unsigned", SignatureStatus::None, None),
+            ("bad signature", SignatureStatus::Bad, Some(WEB_FLOW)),
+            ("revoked key", SignatureStatus::Revoked, Some(WEB_FLOW)),
+            (
+                "good, other key",
+                SignatureStatus::Good,
+                Some("1111111111111111"),
+            ),
+            ("good, no key id", SignatureStatus::Good, None),
+        ];
+        for (name, status, key) in cases {
+            for config in [policy(false), policy(true)] {
+                let commit = commit_by(RENOVATE, status.clone(), key);
+
+                let result = verify_commit_with(&commit, &trusted_map(), &config);
+
+                assert!(!result.passed, "{name} must fail");
+                assert!(
+                    matches!(result.reason, VerificationReason::AllowListedBadSignature),
+                    "{name}: {:?}",
+                    result.reason
+                );
+            }
+        }
+    }
+
+    /// An allow-list entry can never weaken the trusted-identity rule.
+    #[test]
+    fn test_trusted_identity_is_judged_as_trusted_even_if_also_allow_listed() {
+        let config = VerifyConfig::from_toml(&format!(
+            "[[verify_signatures.allow]]\nemail = \"trusted@example.test\"\nkeys = [\"{WEB_FLOW}\"]\npr_authors = [\"renovate[bot]\"]\n"
+        ))
+        .unwrap();
+        let commit = commit_by("trusted@example.test", SignatureStatus::None, None);
+
+        let result = verify_commit_with(&commit, &trusted_map(), &config);
+
+        assert!(!result.passed);
+        assert!(matches!(
+            result.reason,
+            VerificationReason::ImpersonationAttempt
+        ));
+    }
+
+    #[test]
+    fn test_hard_stop_fails_an_external_contributor_not_on_the_list() {
+        let commit = commit_by("stranger@example.test", SignatureStatus::None, None);
+
+        let (results, summary) = verify_commits_with(vec![commit], &trusted_map(), &policy(true));
+
+        assert!(!results[0].passed);
+        assert!(matches!(
+            results[0].reason,
+            VerificationReason::ExternalNotAllowed {
+                invalid_signature: false
+            }
+        ));
+        assert_eq!(summary.failures, 1);
+        assert_eq!(summary.external_contributors, 1);
+    }
+
+    #[test]
+    fn test_hard_stop_marks_an_external_with_an_invalid_signature() {
+        let commit = commit_by("stranger@example.test", SignatureStatus::Bad, Some("ABCD"));
+
+        let result = verify_commit_with(&commit, &trusted_map(), &policy(true));
+
+        assert!(!result.passed);
+        assert!(matches!(
+            result.reason,
+            VerificationReason::ExternalNotAllowed {
+                invalid_signature: true
+            }
+        ));
+    }
+
+    #[test]
+    fn test_hard_stop_still_passes_trusted_and_allow_listed_commits() {
+        let commits = vec![
+            commit_by(
+                "trusted@example.test",
+                SignatureStatus::Good,
+                Some("TESTKEY12345"),
+            ),
+            commit_by(RENOVATE, SignatureStatus::Good, Some(WEB_FLOW)),
+        ];
+
+        let (results, summary) = verify_commits_with(commits, &trusted_map(), &policy(true));
+
+        assert!(results.iter().all(|r| r.passed));
+        assert_eq!(summary.trusted_verified, 1);
+        assert_eq!(summary.allow_listed, 1);
+        assert_eq!(summary.failures, 0);
+    }
+
+    /// Without the hard stop an external author still passes, as before.
+    #[test]
+    fn test_without_the_hard_stop_external_contributors_still_pass() {
+        let commit = commit_by("stranger@example.test", SignatureStatus::None, None);
+
+        let (results, summary) = verify_commits_with(vec![commit], &trusted_map(), &policy(false));
+
+        assert!(results[0].passed);
+        assert!(matches!(
+            results[0].reason,
+            VerificationReason::ExternalUnsigned
+        ));
+        assert_eq!(summary.failures, 0);
+    }
+
+    /// The default policy (no config file) is exactly the behaviour before.
+    #[test]
+    fn test_default_policy_matches_the_plain_functions() {
+        let commit = commit_by(RENOVATE, SignatureStatus::Good, Some(WEB_FLOW));
+
+        let plain = verify_commit(&commit, &trusted_map());
+        let with = verify_commit_with(&commit, &trusted_map(), &VerifyConfig::default());
+
+        assert_eq!(plain.passed, with.passed);
+        assert!(matches!(plain.reason, VerificationReason::ExternalUnsigned));
+        assert!(matches!(with.reason, VerificationReason::ExternalUnsigned));
+    }
+
+    // --- the PR opener check for web-flow entries (#1132) -------------------
+
+    fn renovate_commit() -> CommitInfo {
+        commit_by(RENOVATE, SignatureStatus::Good, Some(WEB_FLOW))
+    }
+
+    fn with_pr_author(mut config: VerifyConfig, login: Option<&str>) -> VerifyConfig {
+        config.pr_author = login.map(str::to_string);
+        config
+    }
+
+    /// The forgery the check exists for: GitHub signs a commit with the
+    /// web-flow key for whatever author the caller chose, so a commit that
+    /// claims Renovate as author arrives with a good, listed signature. It is
+    /// on someone else's pull request, so it must not be allow-listed.
+    #[test]
+    fn test_web_flow_signed_commit_on_someone_elses_pr_is_not_allow_listed() {
+        for config in [policy(false), policy(true)] {
+            let config = with_pr_author(config, Some("an-attacker"));
+
+            let result = verify_commit_with(&renovate_commit(), &trusted_map(), &config);
+
+            assert!(!result.passed);
+            assert!(matches!(
+                result.reason,
+                VerificationReason::AllowListedWrongOpener
+            ));
+        }
+    }
+
+    /// If GitHub cannot say who opened the PR, the entry cannot be confirmed.
+    #[test]
+    fn test_unknown_pr_opener_fails_closed() {
+        let config = with_pr_author(policy(true), None);
+
+        let result = verify_commit_with(&renovate_commit(), &trusted_map(), &config);
+
+        assert!(!result.passed);
+        assert!(matches!(
+            result.reason,
+            VerificationReason::AllowListedWrongOpener
+        ));
+    }
+
+    #[test]
+    fn test_renovate_on_its_own_pr_is_allow_listed() {
+        let config = with_pr_author(policy(true), Some("Renovate[bot]"));
+
+        let result = verify_commit_with(&renovate_commit(), &trusted_map(), &config);
+
+        assert!(result.passed);
+        assert!(matches!(result.reason, VerificationReason::AllowListed));
+    }
+
+    /// Both checks are needed: the right opener does not rescue a bad signature.
+    #[test]
+    fn test_the_right_opener_does_not_rescue_a_bad_signature() {
+        let unsigned = commit_by(RENOVATE, SignatureStatus::None, None);
+
+        let result = verify_commit_with(&unsigned, &trusted_map(), &policy(true));
+
+        assert!(!result.passed);
+        assert!(matches!(
+            result.reason,
+            VerificationReason::AllowListedBadSignature
+        ));
+    }
+
+    /// An entry for a key that signs only for its owner does not need the
+    /// opener, so an unknown one is fine.
+    #[test]
+    fn test_entry_without_pr_authors_does_not_need_the_opener() {
+        let config = VerifyConfig::from_toml(
+            "[[verify_signatures.allow]]\nemail = \"bot@example.test\"\nkeys = [\"1A2B3C4D5E6F7A8B\"]\n",
+        )
+        .unwrap();
+        let commit = commit_by(
+            "bot@example.test",
+            SignatureStatus::Good,
+            Some("1A2B3C4D5E6F7A8B"),
+        );
+
+        let result = verify_commit_with(&commit, &trusted_map(), &config);
+
+        assert!(result.passed);
+        assert!(matches!(result.reason, VerificationReason::AllowListed));
+    }
+
+    #[test]
+    fn test_wrong_opener_is_a_failure_in_the_summary_and_not_an_external() {
+        let config = with_pr_author(policy(false), Some("an-attacker"));
+
+        let (_, summary) = verify_commits_with(vec![renovate_commit()], &trusted_map(), &config);
+
+        assert_eq!(summary.failures, 1);
+        assert_eq!(summary.allow_listed, 0);
+        assert_eq!(summary.external_contributors, 0);
     }
 }

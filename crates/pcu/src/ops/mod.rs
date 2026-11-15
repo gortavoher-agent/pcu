@@ -9,6 +9,7 @@ mod make_release;
 pub mod signature_ops;
 pub mod trust_fetcher;
 mod update_from_pr;
+pub mod verify_config;
 
 pub use ci_env::{export_ci_branch, write_ci_branch_export, write_ci_checkout_env};
 pub use git_ops::{GitOps, Sign, SignConfig};

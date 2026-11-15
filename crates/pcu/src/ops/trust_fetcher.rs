@@ -329,12 +329,144 @@ fn import_key_to_gpg(raw_key: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Make sure every key an allow-list entry names can be verified.
+///
+/// `git` can only verify a signature whose public key is in the keyring, and
+/// the trust map's keys come from write collaborators, so an allow-listed key
+/// (Renovate's, say) would otherwise be reported as an unknown signature.
+/// Each key not already present is imported from, in order:
+/// 1. the entry's `github_user`, via `GET /users/{login}/gpg_keys`, keeping
+///    only keys whose primary or subkey ID matches one the entry lists;
+/// 2. `keys.openpgp.org`, for a full 40-digit fingerprint only (a short ID can
+///    be collided, a fingerprint cannot).
+///
+/// Importing grants no trust: the entry's pinned `keys` still decide what
+/// passes. GitHub's web-flow key is imported with the trust map and skipped
+/// here. A key that cannot be found is an error, not a warning, so the run
+/// fails with the cause instead of reporting every commit as unverifiable.
+pub async fn import_allow_list_keys(
+    github: &Octocrab,
+    policy: &super::verify_config::VerifyConfig,
+) -> Result<(), Error> {
+    for (index, entry) in policy.allow.iter().enumerate() {
+        let position = index + 1;
+        let mut fetched_user_keys: Option<Vec<GpgKey>> = None;
+
+        for key in &entry.keys {
+            if is_web_flow(key) || key_in_keyring(key) {
+                continue;
+            }
+
+            if let Some(login) = &entry.github_user {
+                if fetched_user_keys.is_none() {
+                    let keys = fetch_gpg_keys(github, login).await.map_err(|e| {
+                        Error::VerifyConfig(format!(
+                            "allow entry {position}: could not fetch the GPG keys of its \
+                             `github_user`: {}",
+                            describe_fetch_error(&e)
+                        ))
+                    })?;
+                    fetched_user_keys = Some(keys);
+                }
+                let wanted = std::slice::from_ref(key);
+                for raw in keys_matching(fetched_user_keys.as_deref().unwrap_or(&[]), wanted) {
+                    import_key_to_gpg(&raw)?;
+                }
+                if key_in_keyring(key) {
+                    continue;
+                }
+            }
+
+            if let Some(url) = keyserver_url(key) {
+                if let Some(armored) = download(&url) {
+                    // A failed import leaves the key missing, caught below.
+                    let _ = import_key_to_gpg(&armored);
+                }
+            }
+
+            if !key_in_keyring(key) {
+                return Err(Error::VerifyConfig(format!(
+                    "allow entry {position}: key ending {} is not in the keyring and could not \
+                     be imported. Set `github_user` to the GitHub account that has the key \
+                     registered, or list its full 40-digit fingerprint so it can be fetched \
+                     from keys.openpgp.org",
+                    &key[key.len().saturating_sub(8)..]
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_web_flow(key: &str) -> bool {
+    let web_flow = super::verify_config::WEB_FLOW_KEY_ID;
+    key.ends_with(web_flow) || web_flow.ends_with(key)
+}
+
+/// Raw keys from `keys` whose primary or subkey ID matches one of `wanted`,
+/// either as a suffix of the other (a long ID against a fingerprint).
+fn keys_matching(keys: &[GpgKey], wanted: &[String]) -> Vec<String> {
+    let matches = |id: &str| {
+        let id = id.to_uppercase();
+        !id.is_empty()
+            && wanted
+                .iter()
+                .any(|w| id.ends_with(w.as_str()) || w.ends_with(id.as_str()))
+    };
+    keys.iter()
+        .filter(|key| {
+            matches(&key.key_id)
+                || key
+                    .subkeys
+                    .iter()
+                    .any(|s| s.key_id.as_deref().is_some_and(matches))
+        })
+        .filter_map(|key| key.raw_key.clone())
+        .collect()
+}
+
+/// Download URL for a key by fingerprint. Only a full fingerprint qualifies.
+fn keyserver_url(key: &str) -> Option<String> {
+    (key.len() == 40 && key.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| format!("https://keys.openpgp.org/vks/v1/by-fingerprint/{key}"))
+}
+
+fn key_in_keyring(key: &str) -> bool {
+    Command::new("gpg")
+        .args(["--batch", "--list-keys", "--with-colons", key])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn download(url: &str) -> Option<String> {
+    let output = Command::new("curl")
+        .args([
+            "-sSLf",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "--max-time",
+            "30",
+            url,
+        ])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Add GitHub's web-flow GPG key for merge commits
 ///
 /// GitHub signs merge commits with their web-flow key.
 /// Key ID: B5690EEEBB952194
 fn add_github_webflow_key(trust_map: &mut TrustMap) -> Result<(), Error> {
-    const GITHUB_WEBFLOW_KEY: &str = "B5690EEEBB952194";
+    const GITHUB_WEBFLOW_KEY: &str = super::verify_config::WEB_FLOW_KEY_ID;
     const GITHUB_WEBFLOW_EMAIL: &str = "noreply@github.com";
 
     log::debug!("Adding GitHub web-flow key for merge commits");
@@ -404,6 +536,51 @@ mod tests {
     const TEST_SUBKEY: &str = "9C0D1E2F3A4B5C6D";
     const TEST_USER: &str = "test-user-999";
     const TEST_USER_ID: i64 = 999_000_001;
+
+    #[test]
+    fn keys_matching_picks_primary_or_subkey_matches_only() {
+        let wanted = vec!["9C0D1E2F3A4B5C6D".to_string()];
+        let mut by_subkey = make_gpg_key(TEST_PRIMARY_KEY, "a@b.test", &[TEST_SUBKEY]);
+        by_subkey.raw_key = Some("SUBKEY-MATCH".into());
+        let mut other = make_gpg_key("FFFFFFFFFFFFFFFF", "c@d.test", &[]);
+        other.raw_key = Some("OTHER".into());
+        let mut no_raw = make_gpg_key(TEST_SUBKEY, "e@f.test", &[]);
+        no_raw.raw_key = None;
+
+        let got = keys_matching(&[by_subkey, other, no_raw], &wanted);
+        assert_eq!(got, vec!["SUBKEY-MATCH".to_string()]);
+    }
+
+    #[test]
+    fn keys_matching_accepts_a_fingerprint_against_a_long_id() {
+        let fingerprint = format!("{}{}", "0".repeat(24), TEST_PRIMARY_KEY);
+        let mut key = make_gpg_key(TEST_PRIMARY_KEY, "a@b.test", &[]);
+        key.raw_key = Some("RAW".into());
+        assert_eq!(keys_matching(&[key], &[fingerprint]).len(), 1);
+    }
+
+    #[test]
+    fn only_a_full_fingerprint_is_fetched_from_a_keyserver() {
+        let fingerprint = "A".repeat(40);
+        assert!(keyserver_url(&fingerprint).unwrap().ends_with(&fingerprint));
+        assert!(
+            keyserver_url("B5690EEEBB952194").is_none(),
+            "short id can be collided"
+        );
+        assert!(keyserver_url(&"G".repeat(40)).is_none());
+    }
+
+    #[test]
+    fn web_flow_is_recognised_in_both_forms() {
+        assert!(is_web_flow("B5690EEEBB952194"));
+        assert!(is_web_flow(&format!("{}B5690EEEBB952194", "0".repeat(24))));
+        assert!(!is_web_flow("1A2B3C4D5E6F7A8B"));
+    }
+
+    #[test]
+    fn a_key_absent_from_the_keyring_is_reported_absent() {
+        assert!(!key_in_keyring("0123456789ABCDEF0123456789ABCDEF01234567"));
+    }
 
     #[test]
     fn test_only_a_404_means_the_account_is_gone() {

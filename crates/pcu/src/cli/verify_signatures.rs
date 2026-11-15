@@ -7,8 +7,10 @@ use owo_colors::OwoColorize;
 use super::CIExit;
 use crate::{
     ops::{
-        git_signature_ops::extract_commits, signature_ops::verify_commits,
-        trust_fetcher::fetch_trust_list,
+        git_signature_ops::extract_commits,
+        signature_ops::verify_commits_with,
+        trust_fetcher::{fetch_trust_list, import_allow_list_keys},
+        verify_config::VerifyConfig,
     },
     Error,
 };
@@ -18,6 +20,14 @@ pub struct VerifySignatures {
     /// Base ref for commit range
     #[clap(long, default_value = "origin/main")]
     pub base: String,
+
+    /// Ref the verification policy (`pcu.toml`) is read from: the allow list
+    /// and the hard stop. Deliberately separate from `--base`, which only
+    /// chooses where the commit range starts: `--base HEAD~3` must not make the
+    /// policy come from a commit that predates it. Must be a ref the branch
+    /// under review cannot change, normally the default branch.
+    #[clap(long, default_value = "origin/main")]
+    pub policy_ref: String,
 
     /// Head ref for commit range
     #[clap(long, default_value = "HEAD")]
@@ -35,9 +45,19 @@ pub struct VerifySignatures {
     #[clap(long, default_value = "200")]
     pub fetch_depth: usize,
 
-    /// Fail if trusted identities have unsigned commits
+    /// Deprecated and always on: this switch cannot be turned off from the
+    /// command line, and a failure always fails the run. Kept so existing
+    /// command lines keep working. It used to decide only whether the PR
+    /// comment was posted before failing.
     #[clap(long, default_value_t = true)]
     pub fail_on_unsigned: bool,
+
+    /// Fail for commits from authors who are neither trusted nor on the allow
+    /// list. Can also be set with `fail_on_external = true` under
+    /// `[verify_signatures]` in `pcu.toml` at the base ref, which a branch
+    /// cannot change.
+    #[clap(long)]
+    pub fail_on_external: bool,
 
     /// Post verification results as a PR comment
     #[clap(long)]
@@ -57,11 +77,13 @@ impl std::fmt::Debug for VerifySignatures {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VerifySignatures")
             .field("base", &self.base)
+            .field("policy_ref", &self.policy_ref)
             .field("head", &self.head)
             .field("repo_owner", &self.repo_owner)
             .field("repo_name", &self.repo_name)
             .field("fetch_depth", &self.fetch_depth)
             .field("fail_on_unsigned", &self.fail_on_unsigned)
+            .field("fail_on_external", &self.fail_on_external)
             .field("post_comment", &self.post_comment)
             .field("pr_number", &self.pr_number)
             .field("github_token", &super::Redacted(&self.github_token))
@@ -152,6 +174,37 @@ impl VerifySignatures {
         log::info!("Fetching trust list from GitHub...");
         let trust_map = fetch_trust_list(&readonly_client, &owner, &repo).await?;
 
+        // Policy (allow list, hard stop) from the policy ref, never the branch
+        // under review: a PR must not be able to allow-list itself.
+        let mut policy = resolve_policy(&git_repo, &self.policy_ref, self.fail_on_external)?;
+        log::info!(
+            "Policy from {}: {} allow-list entr{}, hard stop for external contributors {}",
+            self.policy_ref,
+            policy.allow.len(),
+            if policy.allow.len() == 1 { "y" } else { "ies" },
+            if policy.fail_on_external { "on" } else { "off" }
+        );
+
+        // Allow-listed keys must be in the keyring for git to verify them.
+        import_allow_list_keys(&readonly_client, &policy).await?;
+
+        // Entries that name GitHub's web-flow key also need the login that
+        // opened the PR, which GitHub authenticates. Only look it up when an
+        // entry needs it. Unknown stays None, and those entries then fail.
+        if policy.needs_pr_author() {
+            let pr = self.pr_number.or_else(pr_number_from_env);
+            policy.pr_author = match pr {
+                Some(number) => fetch_pr_author(&readonly_client, &owner, &repo, number).await,
+                None => {
+                    log::warn!(
+                        "No pull request number (--pr-number or CIRCLE_PULL_REQUEST): \
+                         allow-list entries that require a PR author will fail"
+                    );
+                    None
+                }
+            };
+        }
+
         // Step 2: Extract commits from git
         log::info!("Extracting commits from {}..{}", self.base, self.head);
         let commits = extract_commits(&git_repo, &self.base, &self.head)?;
@@ -163,19 +216,14 @@ impl VerifySignatures {
 
         println!("ℹ  Found {} commit(s) to verify\n", commits.len());
 
-        // Step 3: Verify commits
-        let (results, summary) = verify_commits(commits, &trust_map);
+        // Step 3: Verify commits against the trust map and the policy
+        let (results, summary) = verify_commits_with(commits, &trust_map, &policy);
 
         // Step 4: Display results (privacy-safe)
         display_results(&results);
 
         // Step 5: Display summary
         display_summary(&summary, &results);
-
-        // Early return on failure if requested
-        if summary.failures > 0 && self.fail_on_unsigned {
-            return Err(Error::SignatureVerificationFailed(summary.failures));
-        }
 
         // Step 6: Post PR comment if requested
         if self.post_comment {
@@ -209,10 +257,64 @@ impl VerifySignatures {
             }
         }
 
-        if summary.failures > 0 {
-            Err(Error::SignatureVerificationFailed(summary.failures))
-        } else {
-            Ok(CIExit::VerificationPassed)
+        // Fail only after the comment is posted, so a failing run replaces
+        // an earlier "success" comment instead of leaving it on the PR.
+        finish(&summary)
+    }
+}
+
+/// The run's outcome: any failure fails it. Nothing, including the deprecated
+/// `--fail-on-unsigned`, can turn a failure into a pass.
+fn finish(summary: &crate::ops::signature_ops::VerificationSummary) -> Result<CIExit, Error> {
+    if summary.failures > 0 {
+        Err(Error::SignatureVerificationFailed(summary.failures))
+    } else {
+        Ok(CIExit::VerificationPassed)
+    }
+}
+
+/// Read the policy from `policy_ref` and apply the `--fail-on-external` flag,
+/// which can only switch the hard stop on, never off.
+fn resolve_policy(
+    repo: &git2::Repository,
+    policy_ref: &str,
+    fail_on_external_flag: bool,
+) -> Result<VerifyConfig, Error> {
+    let mut policy = VerifyConfig::load_from_ref(repo, policy_ref)?;
+    if fail_on_external_flag {
+        policy.fail_on_external = true;
+    }
+    Ok(policy)
+}
+
+/// The pull request number from CircleCI's `CIRCLE_PULL_REQUEST` URL.
+fn pr_number_from_env() -> Option<u64> {
+    parse_pr_number(&env::var("CIRCLE_PULL_REQUEST").ok()?)
+}
+
+/// The number at the end of a pull request URL.
+fn parse_pr_number(url: &str) -> Option<u64> {
+    url.trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The GitHub login that opened a pull request, or `None` if it cannot be
+/// determined (the failure is logged without the response body).
+async fn fetch_pr_author(
+    github: &Octocrab,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Option<String> {
+    match github.pulls(owner, repo).get(number).await {
+        Ok(pr) => pr.user.map(|user| user.login),
+        Err(e) => {
+            log::warn!("Could not look up who opened PR #{number}: {e}");
+            None
         }
     }
 }
@@ -266,6 +368,11 @@ fn build_comment(
             write_external_contributors(&mut comment, results).map_err(write_err)?;
         }
 
+        if summary.allow_listed > 0 {
+            writeln!(&mut comment).map_err(write_err)?;
+            write_allow_listed(&mut comment, results).map_err(write_err)?;
+        }
+
         writeln!(&mut comment).map_err(write_err)?;
         write_action_required(&mut comment).map_err(write_err)?;
     } else {
@@ -283,6 +390,11 @@ fn build_comment(
         if summary.external_contributors > 0 {
             writeln!(&mut comment).map_err(write_err)?;
             write_external_contributors(&mut comment, results).map_err(write_err)?;
+        }
+
+        if summary.allow_listed > 0 {
+            writeln!(&mut comment).map_err(write_err)?;
+            write_allow_listed(&mut comment, results).map_err(write_err)?;
         }
 
         writeln!(&mut comment).map_err(write_err)?;
@@ -331,6 +443,9 @@ fn write_summary(
         "- **Trusted verified**: {}",
         summary.trusted_verified
     )?;
+    if summary.allow_listed > 0 {
+        writeln!(comment, "- **Allow-listed**: {}", summary.allow_listed)?;
+    }
     writeln!(
         comment,
         "- **External contributors**: {}",
@@ -353,7 +468,21 @@ fn write_action_required(comment: &mut String) -> std::fmt::Result {
     Ok(())
 }
 
-/// Write external contributors table section
+/// Whether a verification result is for an author who is neither a trusted
+/// identity nor allow-listed.
+fn is_external(reason: &crate::ops::signature_ops::VerificationReason) -> bool {
+    use crate::ops::signature_ops::VerificationReason;
+
+    matches!(
+        reason,
+        VerificationReason::ExternalUnsigned
+            | VerificationReason::ExternalInvalidSignature
+            | VerificationReason::ExternalNotAllowed { .. }
+    )
+}
+
+/// Write external contributors table section. Writes nothing when there are
+/// no external contributors.
 fn write_external_contributors(
     comment: &mut String,
     results: &[crate::ops::signature_ops::VerificationResult],
@@ -362,19 +491,20 @@ fn write_external_contributors(
 
     use crate::ops::signature_ops::VerificationReason;
 
+    let external: Vec<_> = results.iter().filter(|r| is_external(&r.reason)).collect();
+    if external.is_empty() {
+        return Ok(());
+    }
+
     writeln!(comment, "### External Contributors")?;
     writeln!(comment)?;
     writeln!(comment, "| Commit | Author | Status |")?;
     writeln!(comment, "|--------|--------|--------|")?;
 
-    for result in results.iter().filter(|r| {
-        matches!(
-            r.reason,
-            VerificationReason::ExternalUnsigned | VerificationReason::ExternalInvalidSignature
-        )
-    }) {
+    for result in external {
         let sha_short = &result.commit.sha[..8.min(result.commit.sha.len())];
         let status = match &result.reason {
+            VerificationReason::ExternalNotAllowed { .. } => "❌ Not on the allow list",
             VerificationReason::ExternalInvalidSignature => {
                 "⚠️ Invalid signature (bad, expired or revoked key)"
             }
@@ -386,6 +516,41 @@ fn write_external_contributors(
             sha_short,
             sanitize_code_span(&result.commit.author_email),
             status
+        )?;
+    }
+    Ok(())
+}
+
+/// Write the allow-listed identities table. Writes nothing when none matched.
+fn write_allow_listed(
+    comment: &mut String,
+    results: &[crate::ops::signature_ops::VerificationResult],
+) -> std::fmt::Result {
+    use std::fmt::Write;
+
+    use crate::ops::signature_ops::VerificationReason;
+
+    let allowed: Vec<_> = results
+        .iter()
+        .filter(|r| matches!(r.reason, VerificationReason::AllowListed))
+        .collect();
+    if allowed.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(comment, "### Allow-listed Identities")?;
+    writeln!(comment)?;
+    writeln!(comment, "| Commit | Author | Signing key |")?;
+    writeln!(comment, "|--------|--------|-------------|")?;
+
+    for result in allowed {
+        let sha_short = &result.commit.sha[..8.min(result.commit.sha.len())];
+        writeln!(
+            comment,
+            "| `{}` | `{}` | `{}` |",
+            sha_short,
+            sanitize_code_span(&result.commit.author_email),
+            sanitize_code_span(result.commit.key_id.as_deref().unwrap_or(""))
         )?;
     }
     Ok(())
@@ -528,14 +693,18 @@ fn display_summary(
     summary: &crate::ops::signature_ops::VerificationSummary,
     results: &[crate::ops::signature_ops::VerificationResult],
 ) {
-    use crate::ops::signature_ops::VerificationReason;
-
     println!("{}\n", "=== Verification Summary ===".bold());
     println!("Commits checked:         {}", summary.commits_checked);
     println!(
         "Trusted verified:        {}",
         summary.trusted_verified.to_string().green()
     );
+    if summary.allow_listed > 0 {
+        println!(
+            "Allow-listed:            {}",
+            summary.allow_listed.to_string().green()
+        );
+    }
     println!(
         "External contributors:   {}",
         summary.external_contributors.to_string().green()
@@ -558,15 +727,7 @@ fn display_summary(
     }
 
     // List external contributors with their identities
-    let external: Vec<_> = results
-        .iter()
-        .filter(|r| {
-            matches!(
-                r.reason,
-                VerificationReason::ExternalUnsigned | VerificationReason::ExternalInvalidSignature
-            )
-        })
-        .collect();
+    let external: Vec<_> = results.iter().filter(|r| is_external(&r.reason)).collect();
 
     if !external.is_empty() {
         println!("{}", "External Contributors:".bold());
@@ -647,6 +808,7 @@ mod tests {
         let summary = VerificationSummary {
             commits_checked: 1,
             trusted_verified: 0,
+            allow_listed: 0,
             external_contributors: 1,
             failures: 0,
         };
@@ -669,6 +831,7 @@ mod tests {
         let summary = VerificationSummary {
             commits_checked: 1,
             trusted_verified: 0,
+            allow_listed: 0,
             external_contributors: 1,
             failures: 0,
         };
@@ -691,6 +854,7 @@ mod tests {
         let summary = VerificationSummary {
             commits_checked: 1,
             trusted_verified: 0,
+            allow_listed: 0,
             external_contributors: 1,
             failures: 0,
         };
@@ -711,6 +875,7 @@ mod tests {
         let summary = VerificationSummary {
             commits_checked: 0,
             trusted_verified: 0,
+            allow_listed: 0,
             external_contributors: 0,
             failures: 0,
         };
@@ -726,6 +891,7 @@ mod tests {
         VerificationSummary {
             commits_checked: failures + external,
             trusted_verified: 0,
+            allow_listed: 0,
             external_contributors: external,
             failures,
         }
@@ -828,5 +994,285 @@ mod tests {
             secret,
         ]);
         assert!(!format!("{issue:?}").contains(secret));
+    }
+
+    // --- allow list and hard stop (#1132) -----------------------------------
+
+    fn result_with(
+        sha: &str,
+        email: &str,
+        reason: VerificationReason,
+        passed: bool,
+        key: Option<&str>,
+    ) -> VerificationResult {
+        VerificationResult {
+            commit: CommitInfo {
+                sha: sha.to_string(),
+                author_email: email.to_string(),
+                author_name: "Someone".to_string(),
+                subject: "a commit".to_string(),
+                signature_status: SignatureStatus::Good,
+                key_id: key.map(str::to_string),
+                signer: None,
+            },
+            passed,
+            reason,
+        }
+    }
+
+    fn summary_with(allow_listed: usize, external: usize, failures: usize) -> VerificationSummary {
+        VerificationSummary {
+            commits_checked: allow_listed + external + failures,
+            trusted_verified: 0,
+            allow_listed,
+            external_contributors: external,
+            failures,
+        }
+    }
+
+    #[test]
+    fn test_comment_lists_allow_listed_identities_with_their_key() {
+        let results = vec![result_with(
+            "aabbccdd1122",
+            "29139614+renovate[bot]@users.noreply.github.com",
+            VerificationReason::AllowListed,
+            true,
+            Some("B5690EEEBB952194"),
+        )];
+
+        let comment = build_comment(&results, &summary_with(1, 0, 0)).unwrap();
+
+        assert!(comment.contains("### Allow-listed Identities"), "{comment}");
+        assert!(comment.contains("- **Allow-listed**: 1"), "{comment}");
+        assert!(comment.contains("`B5690EEEBB952194`"), "{comment}");
+        assert!(comment.contains("`aabbccdd`"), "{comment}");
+        assert!(!comment.contains("### External Contributors"), "{comment}");
+        assert!(
+            comment.contains("All commits have been verified"),
+            "{comment}"
+        );
+    }
+
+    #[test]
+    fn test_comment_omits_the_allow_listed_section_when_none_matched() {
+        let results = vec![make_external_result("a1b2c3d4e5f6", "x@example.test")];
+
+        let comment = build_comment(&results, &summary_with(0, 1, 0)).unwrap();
+
+        assert!(!comment.contains("Allow-listed"), "{comment}");
+    }
+
+    /// With the hard stop on, a commit from an unlisted external author fails,
+    /// is listed under the failed commits and shown as not allowed.
+    #[test]
+    fn test_comment_reports_the_hard_stop_as_a_failure() {
+        let results = vec![result_with(
+            "deadbeef0000",
+            "stranger@example.test",
+            VerificationReason::ExternalNotAllowed {
+                invalid_signature: false,
+            },
+            false,
+            None,
+        )];
+
+        let comment = build_comment(&results, &summary_with(0, 1, 1)).unwrap();
+
+        assert!(comment.contains("FAILED"), "{comment}");
+        assert!(comment.contains("### Failed Commits"), "{comment}");
+        assert!(
+            comment.contains("External contributor not on the allow list"),
+            "{comment}"
+        );
+        assert!(comment.contains("### External Contributors"), "{comment}");
+        assert!(comment.contains("❌ Not on the allow list"), "{comment}");
+        let table_rows = comment
+            .lines()
+            .filter(|l| l.starts_with("| `deadbeef`"))
+            .count();
+        assert_eq!(table_rows, 1, "the table must not be empty: {comment}");
+    }
+
+    #[test]
+    fn test_comment_reports_an_allow_listed_identity_with_a_bad_signature_as_failed() {
+        let results = vec![result_with(
+            "cafe00001111",
+            "29139614+renovate[bot]@users.noreply.github.com",
+            VerificationReason::AllowListedBadSignature,
+            false,
+            Some("1111111111111111"),
+        )];
+
+        let comment = build_comment(&results, &summary_with(0, 0, 1)).unwrap();
+
+        assert!(comment.contains("FAILED"), "{comment}");
+        assert!(
+            comment.contains(
+                "Allow-listed identity: signature missing, invalid or from an unapproved key"
+            ),
+            "{comment}"
+        );
+    }
+
+    #[test]
+    fn test_fail_on_external_flag_is_parsed_and_off_by_default() {
+        use clap::Parser;
+
+        let off = VerifySignatures::parse_from(["verify-signatures"]);
+        let on = VerifySignatures::parse_from(["verify-signatures", "--fail-on-external"]);
+
+        assert!(!off.fail_on_external);
+        assert!(on.fail_on_external);
+        assert!(format!("{on:?}").contains("fail_on_external: true"));
+    }
+
+    // --- policy resolution, outcome and PR number (#1132) -------------------
+
+    use crate::ops::verify_config::test_support::{commit_policy, temp_repo};
+
+    const RENOVATE_POLICY: &str = r#"
+        [verify_signatures]
+        fail_on_external = false
+
+        [[verify_signatures.allow]]
+        email = "29139614+renovate[bot]@users.noreply.github.com"
+        keys = ["B5690EEEBB952194"]
+        pr_authors = ["renovate[bot]"]
+    "#;
+
+    /// `--base` only chooses where the range starts. A commit from before the
+    /// policy existed must not become the policy source.
+    #[test]
+    fn test_policy_comes_from_the_policy_ref_not_from_an_older_base() {
+        let (_dir, repo) = temp_repo();
+        let old = commit_policy(&repo, "refs/heads/old", None, None);
+        commit_policy(&repo, "refs/heads/main", Some(RENOVATE_POLICY), Some(old));
+
+        let from_policy_ref = resolve_policy(&repo, "main", false).unwrap();
+        let from_old_commit = resolve_policy(&repo, "old", false).unwrap();
+
+        assert_eq!(from_policy_ref.allow.len(), 1);
+        assert!(
+            from_old_commit.allow.is_empty(),
+            "reading it from the old commit is what --policy-ref avoids"
+        );
+    }
+
+    #[test]
+    fn test_policy_ref_and_base_are_independent_options() {
+        use clap::Parser;
+
+        let defaults = VerifySignatures::parse_from(["verify-signatures"]);
+        let shifted_base = VerifySignatures::parse_from(["verify-signatures", "--base", "HEAD~3"]);
+        let explicit =
+            VerifySignatures::parse_from(["verify-signatures", "--policy-ref", "origin/trunk"]);
+
+        assert_eq!(defaults.policy_ref, "origin/main");
+        assert_eq!(shifted_base.base, "HEAD~3");
+        assert_eq!(
+            shifted_base.policy_ref, "origin/main",
+            "unaffected by --base"
+        );
+        assert_eq!(explicit.policy_ref, "origin/trunk");
+        assert!(format!("{explicit:?}").contains("origin/trunk"));
+    }
+
+    #[test]
+    fn test_the_flag_can_switch_the_hard_stop_on_but_never_off() {
+        let (_dir, repo) = temp_repo();
+        commit_policy(&repo, "refs/heads/main", Some(RENOVATE_POLICY), None);
+        commit_policy(
+            &repo,
+            "refs/heads/strict",
+            Some("[verify_signatures]\nfail_on_external = true\n"),
+            None,
+        );
+
+        assert!(
+            !resolve_policy(&repo, "main", false)
+                .unwrap()
+                .fail_on_external
+        );
+        assert!(
+            resolve_policy(&repo, "main", true)
+                .unwrap()
+                .fail_on_external
+        );
+        assert!(
+            resolve_policy(&repo, "strict", false)
+                .unwrap()
+                .fail_on_external
+        );
+        assert!(
+            resolve_policy(&repo, "strict", true)
+                .unwrap()
+                .fail_on_external
+        );
+    }
+
+    #[test]
+    fn test_an_unresolvable_or_invalid_policy_is_an_error_not_a_default() {
+        let (_dir, repo) = temp_repo();
+        commit_policy(
+            &repo,
+            "refs/heads/main",
+            Some("[verify_signatures]\nfail_on_extrenal = true\n"),
+            None,
+        );
+
+        assert!(resolve_policy(&repo, "main", false).is_err());
+        assert!(resolve_policy(&repo, "no-such-ref", false).is_err());
+    }
+
+    /// Any failure fails the run. The deprecated `--fail-on-unsigned` is not an
+    /// input to `finish`, so nothing can turn a hard-stop failure into a pass.
+    #[test]
+    fn test_any_failure_fails_the_run() {
+        assert!(matches!(
+            finish(&summary_with(0, 1, 1)),
+            Err(Error::SignatureVerificationFailed(1))
+        ));
+        assert!(matches!(
+            finish(&summary_with(1, 0, 0)),
+            Ok(CIExit::VerificationPassed)
+        ));
+    }
+
+    #[test]
+    fn test_pr_number_is_the_last_segment_of_the_url() {
+        assert_eq!(
+            parse_pr_number("https://github.com/jerus-org/pcu/pull/1133"),
+            Some(1133)
+        );
+        assert_eq!(
+            parse_pr_number("https://github.com/jerus-org/pcu/pull/1133/\n"),
+            Some(1133)
+        );
+        assert_eq!(parse_pr_number("42"), Some(42));
+        assert_eq!(parse_pr_number(""), None);
+        assert_eq!(
+            parse_pr_number("https://github.com/jerus-org/pcu/pulls"),
+            None
+        );
+        assert_eq!(parse_pr_number("not a url"), None);
+    }
+
+    #[test]
+    fn test_comment_explains_a_wrong_opener_failure() {
+        let results = vec![result_with(
+            "feed00001111",
+            "29139614+renovate[bot]@users.noreply.github.com",
+            VerificationReason::AllowListedWrongOpener,
+            false,
+            Some("B5690EEEBB952194"),
+        )];
+
+        let comment = build_comment(&results, &summary_with(0, 0, 1)).unwrap();
+
+        assert!(comment.contains("FAILED"), "{comment}");
+        assert!(
+            comment.contains("pull request not opened by one of its accounts"),
+            "{comment}"
+        );
     }
 }
