@@ -154,6 +154,7 @@ These are understood and not yet fixed. None weakens the gate: each fails closed
 | `description` | Parsed and shown nowhere. | Show it in the allow-listed table, or remove the field. |
 | Key identity | Keys are matched by ID suffix. A fingerprint is recommended but pcu does not compare the signer's fingerprint (`%GF`). | Compare the full fingerprint when an entry lists one, and pin the web-flow fingerprint. |
 | Policy file | The policy shares `pcu.toml` with other commands, and there is no lint-only mode. | Add `--check-policy` and consider a dedicated policy file. |
+| Where it is enforced | The hard stop is enforced only where pcu v0.6.41 or later runs. In this repository that is `test-verify-signatures` (pcu built from the branch). The toolkit's `verify_commit_signatures` jobs run the pcu in the `base_env` image, and pull requests from forks are checked only by those jobs (`test-verify-signatures` skips fork branches), so neither enforces the hard stop until the image carries pcu v0.6.41 or later and the toolkit is updated. | Update the image, release the toolkit, then update this repository's toolkit pin (each step by Renovate). Optionally add a job that builds pcu from `main` and verifies fork pull requests with it. |
 | Test code | Duplicate helpers across the test modules. | Consolidate into `test_support`. |
 
 ## Configuration

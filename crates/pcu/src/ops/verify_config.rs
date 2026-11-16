@@ -434,6 +434,10 @@ mod tests {
         let renovate = policy
             .allow_entry("29139614+renovate[bot]@users.noreply.github.com")
             .expect("Renovate is allow-listed");
+        assert!(
+            policy.fail_on_external,
+            "the hard stop is on for this repository"
+        );
         assert_eq!(renovate.keys, vec![WEB_FLOW_KEY_ID.to_string()]);
         assert_eq!(renovate.pr_authors, vec!["renovate[bot]".to_string()]);
         assert!(renovate.opener_allowed(Some("renovate[bot]")));
