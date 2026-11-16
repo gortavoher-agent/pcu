@@ -446,6 +446,15 @@ mod tests {
             !renovate.opener_allowed(None),
             "unknown opener fails closed"
         );
+
+        let web_ui = policy
+            .allow_entry("47631109+jerusdp@users.noreply.github.com")
+            .expect("the maintainer's web UI edits are allow-listed");
+        assert_eq!(web_ui.keys, vec![WEB_FLOW_KEY_ID.to_string()]);
+        assert!(web_ui.opener_allowed(Some("jerusdp")));
+        assert!(web_ui.opener_allowed(Some("renovate[bot]")));
+        assert!(!web_ui.opener_allowed(Some("someone-else")));
+        assert!(!web_ui.opener_allowed(None), "unknown opener fails closed");
     }
 
     #[test]
