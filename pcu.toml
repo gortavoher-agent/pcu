@@ -1,0 +1,20 @@
+# pcu settings for this repository.
+#
+# [verify_signatures] is read by `pcu verify-signatures` from origin/main, never
+# from the branch being checked, so a pull request cannot allow-list itself.
+# See docs/SIGNATURE_VERIFICATION.md.
+[verify_signatures]
+# Hard stop: fail the run for any commit whose author is neither a trusted
+# write collaborator nor on the allow list below. Left off while the allow list
+# is validated; turn on once a Renovate pull request reports as allow-listed.
+fail_on_external = false
+
+# Renovate creates its commits through GitHub's API, so GitHub's web-flow key
+# signs them, for whatever author the caller names. That key therefore cannot
+# identify Renovate on its own: `pr_authors` also requires that Renovate opened
+# the pull request, which GitHub authenticates.
+[[verify_signatures.allow]]
+email = "29139614+renovate[bot]@users.noreply.github.com"
+keys = ["B5690EEEBB952194"]
+pr_authors = ["renovate[bot]"]
+description = "Renovate: commits created through GitHub's API, signed by the web-flow key"

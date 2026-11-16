@@ -426,6 +426,25 @@ mod tests {
     }
 
     #[test]
+    fn the_policy_shipped_in_this_repository_is_valid() {
+        // The real pcu.toml at the repository root: a typo there is an error
+        // for every verify-signatures run, so catch it before merge.
+        let policy = VerifyConfig::from_toml(include_str!("../../../../pcu.toml")).unwrap();
+
+        let renovate = policy
+            .allow_entry("29139614+renovate[bot]@users.noreply.github.com")
+            .expect("Renovate is allow-listed");
+        assert_eq!(renovate.keys, vec![WEB_FLOW_KEY_ID.to_string()]);
+        assert_eq!(renovate.pr_authors, vec!["renovate[bot]".to_string()]);
+        assert!(renovate.opener_allowed(Some("renovate[bot]")));
+        assert!(!renovate.opener_allowed(Some("someone-else")));
+        assert!(
+            !renovate.opener_allowed(None),
+            "unknown opener fails closed"
+        );
+    }
+
+    #[test]
     fn an_entry_without_keys_is_refused() {
         let message = err(r#"
             [[verify_signatures.allow]]
