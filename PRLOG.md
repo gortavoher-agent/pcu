@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - chore-add verify-signatures policy with the Renovate allow-list entry(pr [#1141])
 
+### Fixed
+
+- deps: lock file maintenance(pr [#1142])
+
 ## [0.6.41] - 2026-11-16
 
 ### Added
@@ -2771,6 +2775,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#1135]: https://github.com/jerus-org/pcu/pull/1135
 [#1138]: https://github.com/jerus-org/pcu/pull/1138
 [#1141]: https://github.com/jerus-org/pcu/pull/1141
+[#1142]: https://github.com/jerus-org/pcu/pull/1142
 [Unreleased]: https://github.com/jerus-org/pcu/compare/v0.6.41...HEAD
 [0.6.41]: https://github.com/jerus-org/pcu/compare/v0.6.40...v0.6.41
 [0.6.40]: https://github.com/jerus-org/pcu/compare/v0.6.39...v0.6.40
