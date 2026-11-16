@@ -5,9 +5,36 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.41] - 2026-11-16
+
+Summary: Added[3], Chore[2], Fixed[14]
+
+### Added
+
+ - feat: import allow-listed keys so their signatures can be verified
+ - feat: verify-signatures allow list and hard stop for external contributors
+ - feat: checkout needs no GitHub credentials and exports CIRCLE_SHA1
+
+### Fixed
+
+ - fix: say why a GitHub App private key is unusable, not that it is missing
+ - fix: bind web-flow allow entries to the PR opener; separate --policy-ref; post comment before failing
+ - fix: harden verify-signatures output and trust inputs
+ - fix: match trusted author emails case-insensitively; keep fork PRs out of the branch-built verify job
+ - fix: fetch collaborators' GPG keys with an absolute route
+ - fix: verify-signatures must not fail open or misreport untrusted authors; add agent signing script
+ - fix(deps): update rust crate toml to 1.2.1
+ - fix(deps): update rust crate openidconnect to 4.1.0
+ - fix(deps): update rust crate aws-lc-rs to 1.19.0
+ - fix(deps): update rust crate octocrab to 0.54.9
+ - fix(deps): update rust crate log to 0.4.35
+ - fix(deps): update rust crate link-bridge to 0.2.8
+ - fix(deps): update rust crate uuid to 1.29.2
+ - fix: address review findings on checkout env export
+
 ## [0.6.40] - 2026-10-22
 
-Summary: Changed[1], Chore[1], Fixed[5], Testing[3]
+Summary: Changed[1], Chore[2], Fixed[5], Testing[3]
 
 ### Fixed
 
@@ -852,7 +879,8 @@ Summary: Added[11], Build[1], Changed[40], Chore[15], Documentation[7], Fixed[14
 
  - chore(deps): update rust crate rstest to 0.21.0
 
-[Unreleased]: https://github.com/jerus-org/pcu/compare/v0.6.39...HEAD
+[Unreleased]: https://github.com/jerus-org/pcu/compare/v0.6.40...HEAD
+[0.6.40]: https://github.com/jerus-org/pcu/compare/v0.6.39...v0.6.40
 [0.6.39]: https://github.com/jerus-org/pcu/compare/v0.6.38...v0.6.39
 [0.6.38]: https://github.com/jerus-org/pcu/compare/v0.6.37...v0.6.38
 [0.6.37]: https://github.com/jerus-org/pcu/compare/v0.6.36...v0.6.37
